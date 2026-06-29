@@ -107,10 +107,12 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
 API_URL = "https://www.vpngate.net/api/iphone/"
 AUTO_OVPN_URL = os.environ.get("AUTO_OVPN_URL", "https://raw.githubusercontent.com/9xN/auto-ovpn/main/json/data.json")
 IPSPEED_URL = os.environ.get("IPSPEED_URL", "https://ipspeed.info/free-openvpn.php")
+VPNBOOK_URL = os.environ.get("VPNBOOK_URL", "https://www.vpnbook.com/zh/freevpn/openvpn")
 NODE_SOURCES = [
     {"name": "vpngate_official", "url": API_URL, "format": "vpngate_csv", "weight": 10, "enabled": True},
     {"name": "auto_ovpn_mirror", "url": AUTO_OVPN_URL, "format": "auto_ovpn_json", "weight": 8, "enabled": True},
     {"name": "ipspeed", "url": IPSPEED_URL, "format": "ipspeed_html", "weight": 5, "enabled": True},
+    {"name": "vpnbook", "url": VPNBOOK_URL, "format": "vpnbook_html", "weight": 3, "enabled": True},
 ]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
@@ -701,6 +703,7 @@ def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     
  
  
+ 
 def parse_auto_ovpn_json(text: str) -> list[dict[str, str]]:
     """解析 9xN/auto-ovpn 的 data.json 格式，输出与 VPNGate CSV 兼容的字典列表。"""
     raw_nodes = json.loads(text)
@@ -732,20 +735,10 @@ def parse_auto_ovpn_json(text: str) -> list[dict[str, str]]:
     return rows
  
 def parse_ipspeed_html(text: str, base_url: str) -> list[dict[str, str]]:
-    """
-    解析 ipspeed.info/free-openvpn.php 的 HTML 页面。
-    提取所有 .ovpn 文件链接，逐个下载配置文件内容，
-    将原始 .ovpn 文本 base64 编码后填入 OpenVPN_ConfigData_Base64，
-    同时从文件名和 HTML 表格中提取 IP、国家等元数据。
-    """
-    from html.parser import HTMLParser
- 
+    """解析 ipspeed.info HTML，提取 .ovpn 链接并逐个下载配置文件。"""
     ovpn_links = re.findall(r'href="([^"]*\.ovpn)"', text)
     ovpn_urls = list(dict.fromkeys([urllib.parse.urljoin(base_url, m) for m in ovpn_links]))
- 
-    # 尝试从 HTML 表格提取 IP→国家映射
     ip_country: dict[str, tuple[str, str]] = {}
-    # 匹配类似: <td>Japan</td> ... <td>219.100.37.176.ovpn</td>
     rows_html = re.findall(r'<tr[^>]*>(.*?)</tr>', text, re.DOTALL | re.IGNORECASE)
     for row_html in rows_html:
         cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL | re.IGNORECASE)
@@ -755,7 +748,6 @@ def parse_ipspeed_html(text: str, base_url: str) -> list[dict[str, str]]:
             ip_match = re.match(r'(\d+\.\d+\.\d+\.\d+)', filename)
             if ip_match and country_long:
                 ip_country[ip_match.group(1)] = (country_long, filename)
- 
     rows = []
     for url in ovpn_urls:
         filename = url.split("/")[-1]
@@ -763,25 +755,15 @@ def parse_ipspeed_html(text: str, base_url: str) -> list[dict[str, str]]:
         ip = ip_match.group(1) if ip_match else ""
         if not ip:
             continue
- 
         country_long, _ = ip_country.get(ip, ("", ""))
-        # 简单国家短码映射（覆盖 IPSpeed 常见国家）
-        _COUNTRY_SHORT = {
-            "Japan": "JP", "South Korea": "KR", "Korea Republic of": "KR",
-            "USA": "US", "United States": "US", "United Kingdom": "GB",
-            "Russian Federation": "RU", "Russia": "RU", "France": "FR",
-            "Canada": "CA", "Thailand": "TH", "Vietnam": "VN",
-            "Argentina": "AR", "Australia": "AU", "Netherlands": "NL",
-            "India": "IN", "Germany": "DE", "Italy": "IT",
-            "Indonesia": "ID", "Poland": "PL", "Romania": "RO",
-            "Sweden": "SE", "Turkey": "TR", "Ukraine": "UA",
-            "Emirates": "AE", "Brazil": "BR", "Mexico": "MX",
-            "China": "CN", "Belarus": "BY", "Macedonia": "MK",
-            "Grenada": "GD",
-        }
-        country_short = _COUNTRY_SHORT.get(country_long, "XX")
- 
-        # 下载 .ovpn 配置文件
+        _CS = {"Japan":"JP","South Korea":"KR","Korea Republic of":"KR","USA":"US",
+               "United States":"US","United Kingdom":"GB","Russian Federation":"RU",
+               "Russia":"RU","France":"FR","Canada":"CA","Thailand":"TH","Vietnam":"VN",
+               "Argentina":"AR","Australia":"AU","Netherlands":"NL","India":"IN",
+               "Germany":"DE","Italy":"IT","Indonesia":"ID","Poland":"PL","Romania":"RO",
+               "Sweden":"SE","Turkey":"TR","Ukraine":"UA","Emirates":"AE","Brazil":"BR",
+               "Mexico":"MX","China":"CN","Belarus":"BY","Macedonia":"MK","Grenada":"GD"}
+        country_short = _CS.get(country_long, "XX")
         try:
             config_text = fetch_api_text(url, True)
         except Exception:
@@ -790,25 +772,101 @@ def parse_ipspeed_html(text: str, base_url: str) -> list[dict[str, str]]:
             except Exception as e:
                 print(f"[ipspeed] 下载 {url} 失败: {e}", flush=True)
                 continue
- 
         config_b64 = base64.b64encode(config_text.encode("utf-8")).decode("ascii")
         rows.append({
-            "IP": ip,
-            "HostName": "",
-            "CountryShort": country_short,
-            "CountryLong": country_long,
-            "Score": "0",
-            "Ping": "0",
-            "Speed": "0",
-            "NumVpnSessions": "0",
+            "IP": ip, "HostName": "", "CountryShort": country_short,
+            "CountryLong": country_long, "Score": "0", "Ping": "0",
+            "Speed": "0", "NumVpnSessions": "0",
             "OpenVPN_ConfigData_Base64": config_b64,
         })
+    return rows
+ 
+def parse_vpnbook_html(text: str, base_url: str) -> list[dict[str, str]]:
+    """
+    解析 vpnbook.com 页面，提取服务器列表和协议，
+    逐个 (server × protocol) 调用 API 下载 .ovpn 配置。
+    VPNBook 使用动态凭证（非 vpn/vpn），需写入独立 auth 文件。
+    """
+    # 提取 servers JSON
+    match = re.search(r'\\"servers\\":(\[.*?\])', text, re.S)
+    if not match:
+        raise RuntimeError("VPNBook: 未找到 servers 数据")
+    servers = json.loads(bytes(match.group(1), "utf-8").decode("unicode_escape"))
+ 
+    # 提取 protocols
+    match2 = re.search(r'\\"openvpn\\":\{.*?\\"protocols\\":\{(.*?)\}\},\\"wireguard\\":\{', text, re.S)
+    if not match2:
+        raise RuntimeError("VPNBook: 未找到 protocols 数据")
+    protocols = list(dict.fromkeys(re.findall(r'\\"(tcp\d+|udp\d+)\\"', match2.group(1))))
+ 
+    # 提取动态凭证
+    match3 = re.search(r'VPN.*?<code[^>]*>([^<]+)</code>.*?<code[^>]*>([^<]+)</code>', text, re.S)
+    if match3:
+        vb_user, vb_pass = match3.group(1).strip(), match3.group(2).strip()
+    else:
+        # 中文页面用"凭证"
+        match3b = re.search(r'凭证.*?<code[^>]*>([^<]+)</code>.*?<code[^>]*>([^<]+)</code>', text, re.S)
+        if match3b:
+            vb_user, vb_pass = match3b.group(1).strip(), match3b.group(2).strip()
+        else:
+            vb_user, vb_pass = "vpn", "vpn"
+ 
+    # 写入 VPNBook 专用 auth 文件
+    try:
+        DATA_DIR.mkdir(exist_ok=True, parents=True)
+        (DATA_DIR / "vpnbook_auth.txt").write_text(f"{vb_user}\n{vb_pass}\n", encoding="utf-8")
+    except Exception:
+        pass
+ 
+    print(f"[vpnbook] 服务器={len(servers)} 协议={len(protocols)} "
+          f"总配置={len(servers)*len(protocols)} 凭证={vb_user}/{vb_pass}", flush=True)
+ 
+    rows = []
+    for server in servers:
+        host = server.get("hostname", "")
+        ip = server.get("ipAddress", "")
+        sid = server.get("id", "")
+        country_long = server.get("country", {}).get("name", "") if isinstance(server.get("country"), dict) else str(server.get("country", ""))
+        _CS = {"Japan":"JP","South Korea":"KR","USA":"US","United States":"US",
+               "United Kingdom":"GB","Netherlands":"NL","Germany":"DE","France":"FR",
+               "Canada":"CA","Switzerland":"CH","Poland":"PL","Romania":"RO",
+               "Czech Republic":"CZ","Italy":"IT","Spain":"ES","Finland":"FI",
+               "Sweden":"SE","Singapore":"SG"}
+        country_short = _CS.get(country_long, "XX")
+ 
+        for protocol in protocols:
+            api_url = (f"https://www.vpnbook.com/api/openvpn"
+                       f"?hostname={host}&protocol={protocol}&ip={ip}")
+            try:
+                config_text = fetch_api_text(api_url, True)
+            except Exception:
+                try:
+                    config_text = fetch_api_text(api_url, False)
+                except Exception as e:
+                    print(f"[vpnbook] 下载 {host}/{protocol} 失败: {e}", flush=True)
+                    continue
+ 
+            # 注入 VPNBook 专用 auth-user-pass 指令，覆盖默认 vpn/vpn
+            auth_line = f"\nauth-user-pass {DATA_DIR / 'vpnbook_auth.txt'}\n"
+            if "auth-user-pass" not in config_text:
+                config_text = config_text.rstrip() + auth_line
+            else:
+                config_text = re.sub(r"auth-user-pass\s+\S*", f"auth-user-pass {DATA_DIR / 'vpnbook_auth.txt'}", config_text)
+ 
+            config_b64 = base64.b64encode(config_text.encode("utf-8")).decode("ascii")
+            rows.append({
+                "IP": ip, "HostName": host, "CountryShort": country_short,
+                "CountryLong": country_long, "Score": "0", "Ping": "0",
+                "Speed": "0", "NumVpnSessions": "0",
+                "OpenVPN_ConfigData_Base64": config_b64,
+            })
     return rows
  
 PARSERS = {
     "vpngate_csv": parse_vpngate_rows,
     "auto_ovpn_json": parse_auto_ovpn_json,
     "ipspeed_html": parse_ipspeed_html,
+    "vpnbook_html": parse_vpnbook_html,
 }
 
 def decode_config(encoded: str) -> str:
@@ -926,8 +984,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
                     log_to_json("INFO", "Main", msg)
                     api_text = fetch_api_text(url, verify_ssl)
  
-                    # ipspeed_html 解析器需要额外参数：base_url
-                    if source["format"] == "ipspeed_html":
+                    if source["format"] in ("ipspeed_html", "vpnbook_html"):
                         rows = parser(api_text, url)
                     else:
                         rows = parser(api_text)
@@ -969,11 +1026,7 @@ def fetch_candidates() -> list[dict[str, Any]]:
         full_err_msg = f"所有源均拉取失败: {last_err} | 诊断结果: {diag_msg}"
         print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
         log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
-        set_state(
-            last_fetch_status="error",
-            last_fetch_error_code=err_code,
-            last_fetch_message=diag_msg
-        )
+        set_state(last_fetch_status="error", last_fetch_error_code=err_code, last_fetch_message=diag_msg)
         if last_err:
             raise RuntimeError(diag_msg) from last_err
         else:

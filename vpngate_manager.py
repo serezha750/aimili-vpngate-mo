@@ -105,6 +105,13 @@ def bounded_int(value: Any, default: int, min_value: int | None = None, max_valu
     return parsed
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+AUTO_OVPN_URL = os.environ.get("AUTO_OVPN_URL", "https://raw.githubusercontent.com/9xN/auto-ovpn/main/json/data.json")
+IPSPEED_URL = os.environ.get("IPSPEED_URL", "https://ipspeed.info/free-openvpn.php")
+NODE_SOURCES = [
+    {"name": "vpngate_official", "url": API_URL, "format": "vpngate_csv", "weight": 10, "enabled": True},
+    {"name": "auto_ovpn_mirror", "url": AUTO_OVPN_URL, "format": "auto_ovpn_json", "weight": 8, "enabled": True},
+    {"name": "ipspeed", "url": IPSPEED_URL, "format": "ipspeed_html", "weight": 5, "enabled": True},
+]
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
@@ -691,6 +698,118 @@ def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     if lines and lines[0].startswith("#"):
         lines[0] = lines[0][1:]
     return list(csv.DictReader(lines))
+    
+ 
+ 
+def parse_auto_ovpn_json(text: str) -> list[dict[str, str]]:
+    """解析 9xN/auto-ovpn 的 data.json 格式，输出与 VPNGate CSV 兼容的字典列表。"""
+    raw_nodes = json.loads(text)
+    if not isinstance(raw_nodes, list):
+        raise ValueError(f"auto-ovpn JSON 顶层应为数组，实际为 {type(raw_nodes).__name__}")
+    rows = []
+    for n in raw_nodes:
+        if not isinstance(n, dict):
+            continue
+        config_b64 = (
+            n.get("config_base64")
+            or n.get("openvpn_config_base64")
+            or n.get("OpenVPN_ConfigData_Base64")
+            or ""
+        )
+        if not config_b64:
+            continue
+        rows.append({
+            "IP": n.get("ip", ""),
+            "HostName": n.get("hostname", ""),
+            "CountryShort": n.get("country_short", n.get("countryCode", "XX")),
+            "CountryLong": n.get("country", ""),
+            "Score": str(n.get("score", 0)),
+            "Ping": str(n.get("ping", 0)),
+            "Speed": str(n.get("speed", 0)),
+            "NumVpnSessions": str(n.get("sessions", n.get("numVpnSessions", 0))),
+            "OpenVPN_ConfigData_Base64": config_b64,
+        })
+    return rows
+ 
+def parse_ipspeed_html(text: str, base_url: str) -> list[dict[str, str]]:
+    """
+    解析 ipspeed.info/free-openvpn.php 的 HTML 页面。
+    提取所有 .ovpn 文件链接，逐个下载配置文件内容，
+    将原始 .ovpn 文本 base64 编码后填入 OpenVPN_ConfigData_Base64，
+    同时从文件名和 HTML 表格中提取 IP、国家等元数据。
+    """
+    from html.parser import HTMLParser
+ 
+    ovpn_links = re.findall(r'href="([^"]*\.ovpn)"', text)
+    ovpn_urls = list(dict.fromkeys([urllib.parse.urljoin(base_url, m) for m in ovpn_links]))
+ 
+    # 尝试从 HTML 表格提取 IP→国家映射
+    ip_country: dict[str, tuple[str, str]] = {}
+    # 匹配类似: <td>Japan</td> ... <td>219.100.37.176.ovpn</td>
+    rows_html = re.findall(r'<tr[^>]*>(.*?)</tr>', text, re.DOTALL | re.IGNORECASE)
+    for row_html in rows_html:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row_html, re.DOTALL | re.IGNORECASE)
+        if len(cells) >= 3:
+            country_long = re.sub(r'<[^>]+>', '', cells[1]).strip()
+            filename = re.sub(r'<[^>]+>', '', cells[2]).strip()
+            ip_match = re.match(r'(\d+\.\d+\.\d+\.\d+)', filename)
+            if ip_match and country_long:
+                ip_country[ip_match.group(1)] = (country_long, filename)
+ 
+    rows = []
+    for url in ovpn_urls:
+        filename = url.split("/")[-1]
+        ip_match = re.match(r'(\d+\.\d+\.\d+\.\d+)', filename)
+        ip = ip_match.group(1) if ip_match else ""
+        if not ip:
+            continue
+ 
+        country_long, _ = ip_country.get(ip, ("", ""))
+        # 简单国家短码映射（覆盖 IPSpeed 常见国家）
+        _COUNTRY_SHORT = {
+            "Japan": "JP", "South Korea": "KR", "Korea Republic of": "KR",
+            "USA": "US", "United States": "US", "United Kingdom": "GB",
+            "Russian Federation": "RU", "Russia": "RU", "France": "FR",
+            "Canada": "CA", "Thailand": "TH", "Vietnam": "VN",
+            "Argentina": "AR", "Australia": "AU", "Netherlands": "NL",
+            "India": "IN", "Germany": "DE", "Italy": "IT",
+            "Indonesia": "ID", "Poland": "PL", "Romania": "RO",
+            "Sweden": "SE", "Turkey": "TR", "Ukraine": "UA",
+            "Emirates": "AE", "Brazil": "BR", "Mexico": "MX",
+            "China": "CN", "Belarus": "BY", "Macedonia": "MK",
+            "Grenada": "GD",
+        }
+        country_short = _COUNTRY_SHORT.get(country_long, "XX")
+ 
+        # 下载 .ovpn 配置文件
+        try:
+            config_text = fetch_api_text(url, True)
+        except Exception:
+            try:
+                config_text = fetch_api_text(url, False)
+            except Exception as e:
+                print(f"[ipspeed] 下载 {url} 失败: {e}", flush=True)
+                continue
+ 
+        config_b64 = base64.b64encode(config_text.encode("utf-8")).decode("ascii")
+        rows.append({
+            "IP": ip,
+            "HostName": "",
+            "CountryShort": country_short,
+            "CountryLong": country_long,
+            "Score": "0",
+            "Ping": "0",
+            "Speed": "0",
+            "NumVpnSessions": "0",
+            "OpenVPN_ConfigData_Base64": config_b64,
+        })
+    return rows
+ 
+PARSERS = {
+    "vpngate_csv": parse_vpngate_rows,
+    "auto_ovpn_json": parse_auto_ovpn_json,
+    "ipspeed_html": parse_ipspeed_html,
+}
 
 def decode_config(encoded: str) -> str:
     return base64.b64decode(encoded.encode("ascii"), validate=False).decode("utf-8", errors="replace")
@@ -772,63 +891,82 @@ def fetch_candidates() -> list[dict[str, Any]]:
     blacklist = load_blacklist()
     candidates: list[dict[str, Any]] = []
     seen_ips = set()
-    
-    # 检查本地是否有节点缓存，以确定最大重试尝试次数
+ 
     has_cache = len(cached_nodes()) > 0
     max_attempts = 1 if has_cache else 2
-    
-    # 尝试 URLs 队列: 1. HTTPS(验证证书) 2. HTTPS(不验证证书) 3. HTTP
-    attempts_targets = [
-        (API_URL, True),
-        (API_URL, False)
-    ]
-    if API_URL.startswith("https://"):
-        attempts_targets.append((API_URL.replace("https://", "http://"), True))
-        
-    log_to_json("INFO", "Main", "开始拉取官方 API 节点列表...")
-    
+ 
+    sources = sorted(
+        [s for s in NODE_SOURCES if s.get("enabled")],
+        key=lambda s: s.get("weight", 0),
+        reverse=True,
+    )
+ 
     last_err = None
-    for url, verify_ssl in attempts_targets:
-        for i in range(max_attempts):
-            if i > 0:
-                time.sleep(1.5)
-            try:
-                msg = f"尝试拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
-                print(f"[fetch_candidates] {msg}", flush=True)
-                log_to_json("INFO", "Main", msg)
-                api_text = fetch_api_text(url, verify_ssl)
-                rows = parse_vpngate_rows(api_text)
-                for row in rows[:MAX_SCAN_ROWS]:
-                    ip = row.get("IP", "")
-                    if not ip or ip in seen_ips:
-                        continue
-                    encoded = row.get("OpenVPN_ConfigData_Base64", "")
-                    if not encoded:
-                        continue
-                    try:
-                        config_text = decode_config(encoded)
-                        node = row_to_node(row, config_text)
-                    except Exception as row_exc:
-                        print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
-                        log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
-                        continue
-                    entry = blacklist.get(node["id"])
-                    if entry and float(entry.get("until", 0) or 0) > time.time():
-                        continue
-                    candidates.append(node)
-                    seen_ips.add(ip)
-                if candidates:
-                    break
-            except Exception as e:
-                last_err = e
-                print(f"[fetch_candidates] 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
-                log_to_json("WARNING", "Main", f"拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
-        if candidates:
-            break
-            
+    for source in sources:
+        source_url = source["url"]
+        parser = PARSERS.get(source["format"])
+        if not parser:
+            print(f"[fetch_candidates] 未知格式 {source['format']}，跳过源 {source['name']}", flush=True)
+            continue
+ 
+        attempts_targets = [(source_url, True), (source_url, False)]
+        if source_url.startswith("https://"):
+            attempts_targets.append((source_url.replace("https://", "http://"), True))
+ 
+        log_to_json("INFO", "Main", f"开始从源 {source['name']} 拉取节点列表...")
+ 
+        source_count = 0
+        for url, verify_ssl in attempts_targets:
+            for i in range(max_attempts):
+                if i > 0:
+                    time.sleep(1.5)
+                try:
+                    msg = f"[{source['name']}] 拉取 {url} (SSL验证: {verify_ssl}, 第 {i+1} 次尝试)..."
+                    print(f"[fetch_candidates] {msg}", flush=True)
+                    log_to_json("INFO", "Main", msg)
+                    api_text = fetch_api_text(url, verify_ssl)
+ 
+                    # ipspeed_html 解析器需要额外参数：base_url
+                    if source["format"] == "ipspeed_html":
+                        rows = parser(api_text, url)
+                    else:
+                        rows = parser(api_text)
+ 
+                    for row in rows[:MAX_SCAN_ROWS]:
+                        ip = row.get("IP", "")
+                        if not ip or ip in seen_ips:
+                            continue
+                        encoded = row.get("OpenVPN_ConfigData_Base64", "")
+                        if not encoded:
+                            continue
+                        try:
+                            config_text = decode_config(encoded)
+                            node = row_to_node(row, config_text)
+                            node["source"] = source["name"]
+                        except Exception as row_exc:
+                            print(f"[fetch_candidates] 跳过损坏的节点配置记录: {row_exc}", flush=True)
+                            log_to_json("WARNING", "Main", f"跳过损坏的节点配置记录: {row_exc}")
+                            continue
+                        entry = blacklist.get(node["id"])
+                        if entry and float(entry.get("until", 0) or 0) > time.time():
+                            continue
+                        candidates.append(node)
+                        seen_ips.add(ip)
+                        source_count += 1
+                    if source_count:
+                        break
+                except Exception as e:
+                    last_err = e
+                    print(f"[fetch_candidates] 源 {source['name']} 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}", flush=True)
+                    log_to_json("WARNING", "Main", f"源 {source['name']} 拉取失败 (URL: {url}, 验证: {verify_ssl}): {e}")
+            if source_count:
+                break
+ 
+        log_to_json("INFO", "Main", f"源 {source['name']} 贡献 {source_count} 个节点")
+ 
     if not candidates:
         err_code, diag_msg = vpn_utils.diagnose_api_failure(API_URL)
-        full_err_msg = f"获取官方 API 节点最终失败: {last_err} | 诊断结果: {diag_msg}"
+        full_err_msg = f"所有源均拉取失败: {last_err} | 诊断结果: {diag_msg}"
         print(f"[错误代码 {err_code}] {full_err_msg}", flush=True)
         log_to_json("ERROR", "Main", f"[错误代码 {err_code}] {full_err_msg}")
         set_state(
@@ -840,14 +978,14 @@ def fetch_candidates() -> list[dict[str, Any]]:
             raise RuntimeError(diag_msg) from last_err
         else:
             raise RuntimeError(diag_msg)
-                
+ 
     set_state(
         last_fetch_at=time.time(),
         last_fetch_status="ok",
-        last_fetch_message=f"Fetched {len(candidates)} unique candidates across multiple attempts.",
+        last_fetch_message=f"从 {len(sources)} 个源获取 {len(candidates)} 个候选节点",
         blacklisted_nodes=len(blacklist),
     )
-    log_to_json("INFO", "Main", f"成功获取官方 API 节点，共 {len(candidates)} 个候选节点")
+    log_to_json("INFO", "Main", f"多源获取完成，共 {len(candidates)} 个候选节点")
     return candidates
 
 def cached_nodes() -> list[dict[str, Any]]:

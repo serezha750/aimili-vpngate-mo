@@ -28,7 +28,7 @@ Bilingual: [中文](#中文) | [English](#english)
 在你的 Linux VPS 上以 root 执行：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/Guli-Joy/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/serezha750/aimili-vpngate-mo/main/install.sh)
 ```
 
 > 💡 安装脚本会自动识别包管理器（apt/apk/dnf/yum）安装依赖（openvpn、python3、iproute2、iptables 等）、注册系统服务（systemd 或 OpenRC）、生成随机管理员账号密码与带安全后缀的后台地址，并安装交互式命令行菜单 `ml`。部署完成后终端会打印专属后台链接，如 `http://你的IP:8787/u71e9IXp4TPx`。

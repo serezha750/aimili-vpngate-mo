@@ -119,14 +119,14 @@ FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
-OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
-OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 8, 1, 64)
+OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 15, 1)
+OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 7, 1, 64)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
 # 默认槽位数为 0 表示沿用传统单出口模式；可在 Web UI 运行时调整槽位数。
-MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 50, 1)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 100, 1)
 DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0)
 # tun 设备基准号：测速使用 tun2..tun99，主连接用 tun0，槽位从 tun100 起，彻底避开冲突
 SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 100, 100, 900)
@@ -138,7 +138,7 @@ SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "0.0.0.0")
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 # 槽位出口连通性健康检测：真实经 socks 端口 curl 一次，验证节点是否真转发流量
-SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
+SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 120, 10)
 SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 2, 1)
 SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 600, 60)
 # 主连接(7928)出口加固：与多出口槽位对齐。
@@ -1094,6 +1094,16 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", ext
             "--auth-user-pass",
             str(AUTH_FILE),
             "--auth-nocache",
+            # ---------- 新增内存优化参数 ----------
+            "--verb", "1",                    # 原为 3，现仅输出关键错误（减少日志缓冲）
+            "--mute-replay-warnings",         # 抑制重复警告，减少日志生成
+            "--persist-key",                  # 保持密钥，避免重复加载（减少临时分配）
+            "--persist-tun",                  # 保持 tun 设备，减少重连时的重建开销
+            "--single-session",               # 强制单会话，避免多余会话上下文
+            "--sndbuf", "0",                  # 让系统自动调整发送缓冲区
+            "--rcvbuf", "0",                  # 让系统自动调整接收缓冲区
+            # ---------- 可选：禁用压缩（若节点不需要） ----------
+            # "--comp-lzo", "no",             # 默认注释，如确知节点未启用压缩可取消注释
         ]
     )
     
@@ -1103,7 +1113,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", ext
     else:
         command.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
 
-    command.extend(["--verb", "3"])
+    # 原代码中的 --verb 3 已被替换，不再重复添加
+    # 原添加的 --verb 3 已删除（由上面的 --verb 1 覆盖）
     
     if os.path.exists("/etc/ssl/certs"):
         command.extend(["--capath", "/etc/ssl/certs"])
@@ -2545,35 +2556,101 @@ def supervise_exit_slots_once() -> None:
             if i not in active:
                 tear_down_slot(i, stop_proxy=True)
 
+        # 预先获取所有可用节点（一次读取，全局缓存）
+        all_nodes = read_nodes()
+        # 预过滤：只取可用节点
+        available_nodes = [n for n in all_nodes if n.get('probe_status') == 'available']
+        if not available_nodes:
+            print("[多出口] 没有可用节点，跳过本轮启动", flush=True)
+            write_slots_state()
+            return
+
         # 用于记录本轮已预定的节点 ID，避免重复
-        reserved_node_ids = set()
+        reserved_node_ids = set(current_slot_node_ids())  # 当前已运行的节点ID
         tasks = []  # list of (slot_index, node_dict)
+
+        # 预计算每个槽位的过滤条件，避免重复获取配置
+        slot_country_cache = {}
+        slot_isp_cache = {}
+        slot_residential_only = get_exit_slot_config().get('residential_only', True)
+        global_country = get_exit_slot_config().get('country', '')
+        global_isp = get_exit_slot_config().get('isp', '')
 
         for i in sorted(active):
             if i in paused:
-                if (i in exit_slot_proxy_stops) or (i in exit_slots and exit_slots[i].get("process") is not None):
+                if (i in exit_slot_proxy_stops) or (i in exit_slots and exit_slots[i].get('process') is not None):
                     tear_down_slot(i, stop_proxy=True)
                 mark_slot_paused(i)
                 continue
 
             if slot_process_alive(i):
+                # 已运行的槽位，保留其节点在reserved中（已在current_slot_node_ids）
                 continue
 
             # 清理死进程/残留路由，准备拉起
             tear_down_slot(i, stop_proxy=False)
 
-            # 构建已用节点集合：当前运行中的 + 本轮已预定的
-            used = current_slot_node_ids() | reserved_node_ids
-            node = pick_slot_node(i, used)
-            if node:
-                reserved_node_ids.add(node['id'])   # 预定该节点
-                tasks.append((i, node))
+            # 获取该槽位自定义地区（否则用全局）
+            country = per_slot_country(i)  # 该函数返回字符串
+            isp = per_slot_isp(i)          # 返回字符串
+            # 构造过滤条件
+            # 如果槽位没有自定义，使用全局
+            if not country:
+                country = global_country
+            if not isp:
+                isp = global_isp
+
+            # 优先处理 pin 节点
+            pin_node_id = get_slot_pin_map().get(str(i))
+            if pin_node_id and pin_node_id not in reserved_node_ids:
+                node = next((n for n in available_nodes if n.get('id') == pin_node_id), None)
+                if node:
+                    # 检查该节点是否符合该槽位的过滤条件（如果槽位有特殊要求）
+                    # 但我们还是应该检查地区/isp等是否符合，若不符合，强制采用pin可能打破规则，但pin是用户明确指定，应尊重
+                    # 我们简单检查一下是否可用，然后直接分配，不额外过滤（用户指定表示认可）
+                    reserved_node_ids.add(pin_node_id)
+                    tasks.append((i, node))
+                    continue
+
+            # 没有pin或pin不可用，自动选择
+            # 我们需要从 available_nodes 中筛选符合该槽位过滤条件的节点，同时排除已保留的
+            # 为提高效率，我们在这里进行一次筛选（相对于每个槽位都遍历全部节点，我们只遍历一次）
+            # 但不同槽位过滤条件不同，所以无法一次性全局筛选，只能为每个槽位筛选一次
+            # 但我们可以使用列表推导，每次遍历 available_nodes，但每次都是轻量级比较，开销可接受
+            # 为了避免重复遍历，也可以预先按地区分组，但实现复杂，先采用直接筛选
+            candidate = None
+            for node in available_nodes:
+                if node['id'] in reserved_node_ids:
+                    continue
+                # 检查国家
+                if country:
+                    node_country = node.get('country_short', '').upper()
+                    # country 可能是 "JP" 或 "JP,KR"
+                    allowed = [c.strip().upper() for c in country.split(',') if c.strip()]
+                    if allowed and node_country not in allowed:
+                        continue
+                # 检查ISP
+                if isp:
+                    isp_kws = [k.strip().lower() for k in isp.split(',') if k.strip()]
+                    hay = (str(node.get('owner', '')) + ' ' + str(node.get('as_name', '')) + ' ' + str(node.get('asn', ''))).lower()
+                    if not any(kw in hay for kw in isp_kws):
+                        continue
+                # 检查住宅/移动
+                if slot_residential_only and node.get('ip_type') not in ('residential', 'mobile'):
+                    continue
+                # 通过所有过滤，分配
+                candidate = node
+                break
+
+            if candidate:
+                reserved_node_ids.add(candidate['id'])
+                tasks.append((i, candidate))
             else:
-                scope = per_slot_country(i) or "不限地区"
+                scope = country or "不限地区"
                 mark_slot_pending(i, f"暂无可用住宅节点（{scope}），等待节点池补齐")
 
-        # 并发启动（使用 _bring_up_wrapper）
-        max_parallel = min(30, len(tasks))
+        # 并发启动
+        max_parallel = min(20, len(tasks))  # 降低并发数
         if tasks:
             print(f"[多出口] 共 {len(tasks)} 个槽位待启动，并发数 {max_parallel}，预计分批完成...", flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:

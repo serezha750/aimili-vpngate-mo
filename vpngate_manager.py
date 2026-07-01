@@ -125,8 +125,8 @@ TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
 # 默认槽位数为 0 表示沿用传统单出口模式；可在 Web UI 运行时调整槽位数。
-MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 200, 1, 200)
-DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 200)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 100, 1, 999)
+DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 999)
 # tun 设备基准号：测速使用 tun2..tun99，主连接用 tun0，槽位从 tun120 起，彻底避开冲突
 SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
 SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
@@ -135,6 +135,10 @@ SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 60000)
 # 与主代理的 LOCAL_PROXY_HOST 解耦，避免主代理对公网开放时连带暴露所有住宅出口。
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "0.0.0.0")
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
+# ---- 槽位拨号限速：每轮供给循环最多拨号几个新槽位，防止低配 VPS 被打爆 ----
+SLOT_BRINGUP_PER_CYCLE = env_int("SLOT_BRINGUP_PER_CYCLE", 3, 1, 50)
+# ---- 槽位拨号间隔：两次拨号之间的休息秒数，给 CPU 喘气 ----
+SLOT_BRINGUP_DELAY = env_int("SLOT_BRINGUP_DELAY", 5, 0, 60)
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 # 槽位出口连通性健康检测：真实经 socks 端口 curl 一次，验证节点是否真转发流量
 SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
@@ -2569,7 +2573,8 @@ def supervise_exit_slots_once() -> None:
                     f"（可用节点 {available_count}，运行中 {len(running_indices)}）",
                     flush=True,
                 )
-    # ===== 以下原有逻辑不变 =====
+ 
+    # ===== 限速供给：每轮最多拨号 SLOT_BRINGUP_PER_CYCLE 个新槽位 =====
     # 非阻塞互斥：周期线程与 API 触发线程可能并发，避免对同一槽位重复拨号/累加路由规则
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
@@ -2584,6 +2589,7 @@ def supervise_exit_slots_once() -> None:
             if i not in active:
                 tear_down_slot(i, stop_proxy=True)
  
+        brought_up = 0  # 本轮已拨号计数
         for i in sorted(active):
             if i in paused:
                 # 已停止：确保隧道+代理已拆除，并保留占位以便 UI 显示与端口预留
@@ -2596,11 +2602,20 @@ def supervise_exit_slots_once() -> None:
                 continue
             if slot_process_alive(i):
                 continue
+            # ===== 限速：超过本轮流额就跳过，下轮再填 =====
+            if brought_up >= SLOT_BRINGUP_PER_CYCLE:
+                mark_slot_pending(i, "等待拨号（本轮流额已用完，下轮继续）")
+                continue
             tear_down_slot(i, stop_proxy=False)  # 清理死进程/路由，保留已分配的代理端口
             used = current_slot_node_ids()
             node = pick_slot_node(i, used)
             if node:
-                if not bring_up_slot(i, node):
+                if bring_up_slot(i, node):
+                    brought_up += 1
+                    # 拨号成功后休息，给 CPU 喘气
+                    if SLOT_BRINGUP_DELAY > 0 and brought_up < SLOT_BRINGUP_PER_CYCLE:
+                        time.sleep(SLOT_BRINGUP_DELAY)
+                else:
                     mark_slot_pending(i, f"节点 {node.get('id')} 连接失败，待重试")
             else:
                 scope = per_slot_country(i) or "不限地区"

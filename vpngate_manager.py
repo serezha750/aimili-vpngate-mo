@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -125,20 +126,16 @@ TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
 # 默认槽位数为 0 表示沿用传统单出口模式；可在 Web UI 运行时调整槽位数。
-MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 100, 1, 999)
-DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 999)
-# tun 设备基准号：测速使用 tun2..tun99，主连接用 tun0，槽位从 tun120 起，彻底避开冲突
-SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
-SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 50, 1)
+DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0)
+# tun 设备基准号：测速使用 tun2..tun99，主连接用 tun0，槽位从 tun100 起，彻底避开冲突
+SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 100, 100, 900)
+SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 100, 101, 60000)
 SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 60000)
 # 多出口槽位代理默认仅绑回环：3x-ui 与本项目同机，槽位端口无需也不应暴露公网，
 # 与主代理的 LOCAL_PROXY_HOST 解耦，避免主代理对公网开放时连带暴露所有住宅出口。
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "0.0.0.0")
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
-# ---- 槽位拨号限速：每轮供给循环最多拨号几个新槽位，防止低配 VPS 被打爆 ----
-SLOT_BRINGUP_PER_CYCLE = env_int("SLOT_BRINGUP_PER_CYCLE", 3, 1, 50)
-# ---- 槽位拨号间隔：两次拨号之间的休息秒数，给 CPU 喘气 ----
-SLOT_BRINGUP_DELAY = env_int("SLOT_BRINGUP_DELAY", 5, 0, 60)
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 # 槽位出口连通性健康检测：真实经 socks 端口 curl 一次，验证节点是否真转发流量
 SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 45, 10)
@@ -2535,95 +2532,76 @@ def build_3xui_outbounds() -> dict[str, Any]:
     }
 
 def supervise_exit_slots_once() -> None:
-    # ===== 动态伸缩：可用节点数 = 槽位数 =====
-    try:
-        available_count = sum(
-            1 for n in read_nodes()
-            if n.get("probe_status") == "available"
-        )
-    except Exception:
-        available_count = 0
-    with lock:
-        current_active = get_active_slots()
-        current_count = len(current_active)
-        if available_count != current_count:
-            running_indices: set[int] = set()
-            with exit_slots_lock:
-                for i in current_active:
-                    if i in exit_slots:
-                        p = exit_slots[i].get("process")
-                        if p is not None and p.poll() is None:
-                            running_indices.add(i)
-            # 目标数：取可用节点数，但绝不拆正在运行的槽位
-            target = max(available_count, len(running_indices))
-            target = min(target, MAX_EXIT_SLOTS)
-            if target != current_count:
-                # 保留所有运行中的索引，再补充连续索引凑满 target
-                new_active_set = set(running_indices)
-                for idx in range(target):
-                    if len(new_active_set) >= target:
-                        break
-                    new_active_set.add(idx)
-                new_active = sorted(new_active_set)
-                cfg = load_ui_config()
-                paused = get_paused_slots() & set(new_active)
-                _save_slot_lists(cfg, active=new_active, paused=paused)
-                print(
-                    f"[多出口] 动态伸缩: {current_count} → {len(new_active)} 槽位"
-                    f"（可用节点 {available_count}，运行中 {len(running_indices)}）",
-                    flush=True,
-                )
- 
-    # ===== 限速供给：每轮最多拨号 SLOT_BRINGUP_PER_CYCLE 个新槽位 =====
-    # 非阻塞互斥：周期线程与 API 触发线程可能并发，避免对同一槽位重复拨号/累加路由规则
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
     try:
         active = set(get_active_slots())
         paused = get_paused_slots() & active
- 
+
+        # 拆除已删除槽位
         with exit_slots_lock:
             known_indices = sorted(set(exit_slots.keys()) | set(exit_slot_proxy_stops.keys()))
-        # 拆除已删除（不在启用列表）的槽位
         for i in known_indices:
             if i not in active:
                 tear_down_slot(i, stop_proxy=True)
- 
-        brought_up = 0  # 本轮已拨号计数
+
+        # 用于记录本轮已预定的节点 ID，避免重复
+        reserved_node_ids = set()
+        tasks = []  # list of (slot_index, node_dict)
+
         for i in sorted(active):
             if i in paused:
-                # 已停止：确保隧道+代理已拆除，并保留占位以便 UI 显示与端口预留
-                with exit_slots_lock:
-                    has_runtime = (i in exit_slot_proxy_stops) or (
-                        i in exit_slots and exit_slots[i].get("process") is not None)
-                if has_runtime:
+                if (i in exit_slot_proxy_stops) or (i in exit_slots and exit_slots[i].get("process") is not None):
                     tear_down_slot(i, stop_proxy=True)
                 mark_slot_paused(i)
                 continue
+
             if slot_process_alive(i):
                 continue
-            # ===== 限速：超过本轮流额就跳过，下轮再填 =====
-            if brought_up >= SLOT_BRINGUP_PER_CYCLE:
-                mark_slot_pending(i, "等待拨号（本轮流额已用完，下轮继续）")
-                continue
-            tear_down_slot(i, stop_proxy=False)  # 清理死进程/路由，保留已分配的代理端口
-            used = current_slot_node_ids()
+
+            # 清理死进程/残留路由，准备拉起
+            tear_down_slot(i, stop_proxy=False)
+
+            # 构建已用节点集合：当前运行中的 + 本轮已预定的
+            used = current_slot_node_ids() | reserved_node_ids
             node = pick_slot_node(i, used)
             if node:
-                if bring_up_slot(i, node):
-                    brought_up += 1
-                    # 拨号成功后休息，给 CPU 喘气
-                    if SLOT_BRINGUP_DELAY > 0 and brought_up < SLOT_BRINGUP_PER_CYCLE:
-                        time.sleep(SLOT_BRINGUP_DELAY)
-                else:
-                    mark_slot_pending(i, f"节点 {node.get('id')} 连接失败，待重试")
+                reserved_node_ids.add(node['id'])   # 预定该节点
+                tasks.append((i, node))
             else:
                 scope = per_slot_country(i) or "不限地区"
                 mark_slot_pending(i, f"暂无可用住宅节点（{scope}），等待节点池补齐")
- 
+
+        # 并发启动（使用 _bring_up_wrapper）
+        max_parallel = min(30, len(tasks))
+        if tasks:
+            print(f"[多出口] 共 {len(tasks)} 个槽位待启动，并发数 {max_parallel}，预计分批完成...", flush=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                future_to_slot = {
+                    executor.submit(_bring_up_wrapper, i, node): i
+                    for i, node in tasks
+                }
+                for future in concurrent.futures.as_completed(future_to_slot):
+                    idx = future_to_slot[future]
+                    try:
+                        ok = future.result()
+                        if not ok:
+                            mark_slot_pending(idx, "并发启动连接失败，待重试")
+                    except Exception as e:
+                        print(f"[多出口] 槽位 {idx} 并发启动异常: {e}", flush=True)
+                        mark_slot_pending(idx, f"启动异常: {e}")
+
         write_slots_state()
     finally:
         exit_slots_supervise_lock.release()
+
+def _bring_up_wrapper(i: int, node: dict) -> bool:
+    """供线程池调用的启动包装函数"""
+    try:
+        return bring_up_slot(i, node)
+    except Exception as e:
+        print(f"[多出口] 槽位 {i} bring_up 内部异常: {e}", flush=True)
+        return False
 
 def switch_slot_node(i: int) -> dict[str, Any]:
     """手动为某槽位切换到另一个住宅节点（运营商/IP 质量不满意时重摇）。"""
@@ -2777,6 +2755,14 @@ def slot_egress_checker_loop() -> None:
 def exit_slots_loop() -> None:
     global last_exit_slots_heartbeat
     while True:
+        # ----- 新增：等待节点池就绪 -----
+        nodes = read_nodes()
+        available = [n for n in nodes if n.get("probe_status") == "available"]
+        if not available:
+            print("[多出口] 等待节点池就绪（尚无可用节点），30秒后重试...", flush=True)
+            time.sleep(30)
+            continue
+        # --------------------------------
         last_exit_slots_heartbeat = time.time()
         try:
             supervise_exit_slots_once()
@@ -3995,7 +3981,6 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
-
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点
@@ -4093,7 +4078,7 @@ INDEX_HTML = r"""<!doctype html>
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px;">
         <div class="form-group">
           <label class="form-label" for="slot_count">出口数量 (0 = 关闭)</label>
-          <input type="number" id="slot_count" class="input-field" min="0" max="16" value="0">
+          <input type="number" id="slot_count" class="input-field" min="0" max="100" value="0">
         </div>
         <div class="form-group">
           <label class="form-label" for="slot_country">国家过滤 (留空=不限)</label>

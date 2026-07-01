@@ -125,8 +125,8 @@ TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
 # 默认槽位数为 0 表示沿用传统单出口模式；可在 Web UI 运行时调整槽位数。
-MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 50, 1, 64)
-DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 64)
+MAX_EXIT_SLOTS = env_int("MAX_EXIT_SLOTS", 200, 1, 200)
+DEFAULT_EXIT_SLOTS = env_int("MULTI_EXIT_SLOTS", 0, 0, 200)
 # tun 设备基准号：测速使用 tun2..tun99，主连接用 tun0，槽位从 tun120 起，彻底避开冲突
 SLOT_DEV_BASE = env_int("SLOT_DEV_BASE", 120, 100, 900)
 SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
@@ -2531,20 +2531,59 @@ def build_3xui_outbounds() -> dict[str, Any]:
     }
 
 def supervise_exit_slots_once() -> None:
+    # ===== 动态伸缩：可用节点数 = 槽位数 =====
+    try:
+        available_count = sum(
+            1 for n in read_nodes()
+            if n.get("probe_status") == "available"
+        )
+    except Exception:
+        available_count = 0
+    with lock:
+        current_active = get_active_slots()
+        current_count = len(current_active)
+        if available_count != current_count:
+            running_indices: set[int] = set()
+            with exit_slots_lock:
+                for i in current_active:
+                    if i in exit_slots:
+                        p = exit_slots[i].get("process")
+                        if p is not None and p.poll() is None:
+                            running_indices.add(i)
+            # 目标数：取可用节点数，但绝不拆正在运行的槽位
+            target = max(available_count, len(running_indices))
+            target = min(target, MAX_EXIT_SLOTS)
+            if target != current_count:
+                # 保留所有运行中的索引，再补充连续索引凑满 target
+                new_active_set = set(running_indices)
+                for idx in range(target):
+                    if len(new_active_set) >= target:
+                        break
+                    new_active_set.add(idx)
+                new_active = sorted(new_active_set)
+                cfg = load_ui_config()
+                paused = get_paused_slots() & set(new_active)
+                _save_slot_lists(cfg, active=new_active, paused=paused)
+                print(
+                    f"[多出口] 动态伸缩: {current_count} → {len(new_active)} 槽位"
+                    f"（可用节点 {available_count}，运行中 {len(running_indices)}）",
+                    flush=True,
+                )
+    # ===== 以下原有逻辑不变 =====
     # 非阻塞互斥：周期线程与 API 触发线程可能并发，避免对同一槽位重复拨号/累加路由规则
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
     try:
         active = set(get_active_slots())
         paused = get_paused_slots() & active
-
+ 
         with exit_slots_lock:
             known_indices = sorted(set(exit_slots.keys()) | set(exit_slot_proxy_stops.keys()))
         # 拆除已删除（不在启用列表）的槽位
         for i in known_indices:
             if i not in active:
                 tear_down_slot(i, stop_proxy=True)
-
+ 
         for i in sorted(active):
             if i in paused:
                 # 已停止：确保隧道+代理已拆除，并保留占位以便 UI 显示与端口预留
@@ -2566,7 +2605,7 @@ def supervise_exit_slots_once() -> None:
             else:
                 scope = per_slot_country(i) or "不限地区"
                 mark_slot_pending(i, f"暂无可用住宅节点（{scope}），等待节点池补齐")
-
+ 
         write_slots_state()
     finally:
         exit_slots_supervise_lock.release()
@@ -3941,6 +3980,7 @@ INDEX_HTML = r"""<!doctype html>
     <div id="status" class="status" style="display: none;"><span class="status-dot"></span>服务加载中...</div>
   </div>
   <div class="btn-group">
+
     <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
       <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
       更新节点

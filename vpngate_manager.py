@@ -133,7 +133,7 @@ SLOT_TABLE_BASE = env_int("SLOT_TABLE_BASE", 200, 101, 60000)
 SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 60000)
 # 多出口槽位代理默认仅绑回环：3x-ui 与本项目同机，槽位端口无需也不应暴露公网，
 # 与主代理的 LOCAL_PROXY_HOST 解耦，避免主代理对公网开放时连带暴露所有住宅出口。
-SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "127.0.0.1")
+SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "0.0.0.0")
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
 EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
 # 槽位出口连通性健康检测：真实经 socks 端口 curl 一次，验证节点是否真转发流量

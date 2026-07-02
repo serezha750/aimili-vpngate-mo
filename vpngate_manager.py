@@ -115,8 +115,8 @@ NODE_SOURCES = [
     {"name": "ipspeed", "url": IPSPEED_URL, "format": "ipspeed_html", "weight": 5, "enabled": True},
     {"name": "vpnbook", "url": VPNBOOK_URL, "format": "vpnbook_html", "weight": 3, "enabled": True},
 ]
-FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
-CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
+FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 7200, 1)
+CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 7200, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 15, 1)
@@ -136,11 +136,11 @@ SLOT_PORT_BASE = env_int("SLOT_PORT_BASE", 17928, 1024, 60000)
 # 与主代理的 LOCAL_PROXY_HOST 解耦，避免主代理对公网开放时连带暴露所有住宅出口。
 SLOT_PROXY_HOST = os.environ.get("SLOT_PROXY_HOST", "0.0.0.0")
 SLOT_PROCESS_MARKER = "AIMILI_SLOT"
-EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 30, 5)
+EXIT_SLOTS_CHECK_INTERVAL = env_int("EXIT_SLOTS_CHECK_INTERVAL", 15, 5)
 # 槽位出口连通性健康检测：真实经 socks 端口 curl 一次，验证节点是否真转发流量
-SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 120, 10)
-SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 2, 1)
-SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 600, 60)
+SLOT_EGRESS_CHECK_INTERVAL = env_int("SLOT_EGRESS_CHECK_INTERVAL", 30, 10)
+SLOT_EGRESS_FAIL_THRESHOLD = env_int("SLOT_EGRESS_FAIL_THRESHOLD", 1, 1)
+SLOT_BAD_NODE_COOLDOWN = env_int("SLOT_BAD_NODE_COOLDOWN", 120, 60)
 # 主连接(7928)出口加固：与多出口槽位对齐。
 #   - 连续失败阈值：避免单次抖动即切换，减少无谓漂移。
 #   - 坏节点冷却：切走“握手成功但不转发”的假活节点后，冷却期内不再选回它，防止 flapping。
@@ -2520,7 +2520,7 @@ def write_slots_state() -> None:
     write_json(SLOTS_FILE, {
         "updated_at": time.time(), "desired_count": cfg["count"],
         "country": cfg["country"], "residential_only": cfg["residential_only"],
-        "proxy_host": "127.0.0.1", "slots": snapshot,
+        "proxy_host": "0.0.0.0", "slots": snapshot,
     })
 
 def build_3xui_outbounds() -> dict[str, Any]:
@@ -2543,6 +2543,7 @@ def build_3xui_outbounds() -> dict[str, Any]:
     }
 
 def supervise_exit_slots_once() -> None:
+    """多出口供给器：确保每个启用的槽位隧道运行，若进程存活但节点已失效也强制重新分配。"""
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
     try:
@@ -2556,22 +2557,18 @@ def supervise_exit_slots_once() -> None:
             if i not in active:
                 tear_down_slot(i, stop_proxy=True)
 
-        # 预先获取所有可用节点（一次读取，全局缓存）
+        # 预先获取所有节点，并建立节点状态映射
         all_nodes = read_nodes()
-        # 预过滤：只取可用节点
+        node_status_map = {n.get('id'): n.get('probe_status') for n in all_nodes}
         available_nodes = [n for n in all_nodes if n.get('probe_status') == 'available']
         if not available_nodes:
             print("[多出口] 没有可用节点，跳过本轮启动", flush=True)
             write_slots_state()
             return
 
-        # 用于记录本轮已预定的节点 ID，避免重复
-        reserved_node_ids = set(current_slot_node_ids())  # 当前已运行的节点ID
-        tasks = []  # list of (slot_index, node_dict)
+        reserved_node_ids = set(current_slot_node_ids())
+        tasks = []
 
-        # 预计算每个槽位的过滤条件，避免重复获取配置
-        slot_country_cache = {}
-        slot_isp_cache = {}
         slot_residential_only = get_exit_slot_config().get('residential_only', True)
         global_country = get_exit_slot_config().get('country', '')
         global_isp = get_exit_slot_config().get('isp', '')
@@ -2583,62 +2580,52 @@ def supervise_exit_slots_once() -> None:
                 mark_slot_paused(i)
                 continue
 
+            # ---- 核心修改：即使进程存活，也检查其节点是否已被标记为不可用 ----
             if slot_process_alive(i):
-                # 已运行的槽位，保留其节点在reserved中（已在current_slot_node_ids）
-                continue
+                with exit_slots_lock:
+                    s = exit_slots.get(i)
+                    current_node_id = s.get("node_id") if s else None
+                if current_node_id:
+                    # 如果当前节点的 probe_status 不是 available，则视为失效，需要重新分配
+                    if node_status_map.get(current_node_id) != "available":
+                        print(f"[多出口] 槽位 {i} 的节点 {current_node_id} 已失效，强制拆除并重新分配", flush=True)
+                        tear_down_slot(i, stop_proxy=True)
+                        # 继续下面的分配流程（不 continue，让代码进入分配逻辑）
+                    else:
+                        # 节点仍可用，保留
+                        continue
+                else:
+                    # 没有 node_id，说明异常，拆除重建
+                    tear_down_slot(i, stop_proxy=True)
+            # ------------------------------------------------------------
 
-            # 清理死进程/残留路由，准备拉起
-            tear_down_slot(i, stop_proxy=False)
+            # 清理残留（如果上面拆除过，现在状态已清理）
+            tear_down_slot(i, stop_proxy=False)  # 确保干净
 
-            # 获取该槽位自定义地区（否则用全局）
-            country = per_slot_country(i)  # 该函数返回字符串
-            isp = per_slot_isp(i)          # 返回字符串
-            # 构造过滤条件
-            # 如果槽位没有自定义，使用全局
+            country = per_slot_country(i)
+            isp = per_slot_isp(i)
             if not country:
                 country = global_country
             if not isp:
                 isp = global_isp
 
-            # 优先处理 pin 节点
-            pin_node_id = get_slot_pin_map().get(str(i))
-            if pin_node_id and pin_node_id not in reserved_node_ids:
-                node = next((n for n in available_nodes if n.get('id') == pin_node_id), None)
-                if node:
-                    # 检查该节点是否符合该槽位的过滤条件（如果槽位有特殊要求）
-                    # 但我们还是应该检查地区/isp等是否符合，若不符合，强制采用pin可能打破规则，但pin是用户明确指定，应尊重
-                    # 我们简单检查一下是否可用，然后直接分配，不额外过滤（用户指定表示认可）
-                    reserved_node_ids.add(pin_node_id)
-                    tasks.append((i, node))
-                    continue
-
-            # 没有pin或pin不可用，自动选择
-            # 我们需要从 available_nodes 中筛选符合该槽位过滤条件的节点，同时排除已保留的
-            # 为提高效率，我们在这里进行一次筛选（相对于每个槽位都遍历全部节点，我们只遍历一次）
-            # 但不同槽位过滤条件不同，所以无法一次性全局筛选，只能为每个槽位筛选一次
-            # 但我们可以使用列表推导，每次遍历 available_nodes，但每次都是轻量级比较，开销可接受
-            # 为了避免重复遍历，也可以预先按地区分组，但实现复杂，先采用直接筛选
+            # 自动选择最佳节点（完全忽略 pin）
             candidate = None
             for node in available_nodes:
                 if node['id'] in reserved_node_ids:
                     continue
-                # 检查国家
                 if country:
                     node_country = node.get('country_short', '').upper()
-                    # country 可能是 "JP" 或 "JP,KR"
                     allowed = [c.strip().upper() for c in country.split(',') if c.strip()]
                     if allowed and node_country not in allowed:
                         continue
-                # 检查ISP
                 if isp:
                     isp_kws = [k.strip().lower() for k in isp.split(',') if k.strip()]
                     hay = (str(node.get('owner', '')) + ' ' + str(node.get('as_name', '')) + ' ' + str(node.get('asn', ''))).lower()
                     if not any(kw in hay for kw in isp_kws):
                         continue
-                # 检查住宅/移动
                 if slot_residential_only and node.get('ip_type') not in ('residential', 'mobile'):
                     continue
-                # 通过所有过滤，分配
                 candidate = node
                 break
 
@@ -2647,12 +2634,12 @@ def supervise_exit_slots_once() -> None:
                 tasks.append((i, candidate))
             else:
                 scope = country or "不限地区"
-                mark_slot_pending(i, f"暂无可用住宅节点（{scope}），等待节点池补齐")
+                mark_slot_pending(i, f"暂无可用节点（{scope}），等待节点池补齐")
 
         # 并发启动
-        max_parallel = min(20, len(tasks))  # 降低并发数
+        max_parallel = min(20, len(tasks))
         if tasks:
-            print(f"[多出口] 共 {len(tasks)} 个槽位待启动，并发数 {max_parallel}，预计分批完成...", flush=True)
+            print(f"[多出口] 共 {len(tasks)} 个槽位待启动，并发数 {max_parallel}...", flush=True)
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_slot = {
                     executor.submit(_bring_up_wrapper, i, node): i
@@ -2785,7 +2772,7 @@ def check_slot_egress(port: int) -> tuple[bool, str]:
     return False, ""
 
 def slot_egress_checker_loop() -> None:
-    """周期对每个运行中的槽位做真实出口检测；节点'假活不转发'时标记并自动漂移到其他节点。"""
+    """周期对每个运行中的槽位做真实出口检测；节点'假活不转发'时强制杀死进程并自动漂移。"""
     global last_slot_egress_heartbeat
     time.sleep(20)
     while True:
@@ -2793,9 +2780,11 @@ def slot_egress_checker_loop() -> None:
         try:
             active = set(get_active_slots())
             paused = get_paused_slots()
-            pin_map = get_slot_pin_map()
             for i in sorted(active):
-                if i in paused or not slot_process_alive(i):
+                if i in paused:
+                    continue
+                # 即使进程不存活，也无需检测（但不会发生）
+                if not slot_process_alive(i):
                     continue
                 ok, ip = check_slot_egress(slot_port(i))
                 with exit_slots_lock:
@@ -2813,17 +2802,11 @@ def slot_egress_checker_loop() -> None:
                 slot_egress_fail_counts[i] = 0
                 if nid:
                     slot_bad_nodes[nid] = time.time() + SLOT_BAD_NODE_COOLDOWN
-                if pin_map.get(str(i)):
-                    # 用户锁定的节点：不自动换，仅提示出口不通
-                    print(f"[多出口] 槽位 {i} 锁定节点 {nid} 出口不通（已锁定不自动切换）", flush=True)
-                    with exit_slots_lock:
-                        if i in exit_slots:
-                            exit_slots[i]["message"] = "锁定节点出口不通（点换IP解除锁定或改用其他节点）"
-                    write_slots_state()
-                    continue
-                print(f"[多出口] 槽位 {i} 节点 {nid} 出口不通，标记并自动切换其他节点", flush=True)
-                log_to_json("WARNING", "MultiExit", f"槽位 {i} 节点 {nid} 出口不通，自动漂移")
-                tear_down_slot(i, stop_proxy=False)
+                print(f"[多出口] 槽位 {i} 节点 {nid} 出口不通，强制拆除并切换", flush=True)
+                log_to_json("WARNING", "MultiExit", f"槽位 {i} 节点 {nid} 出口不通，强制漂移")
+                # 关键修改：stop_proxy=True 同时杀死进程和代理
+                tear_down_slot(i, stop_proxy=True)
+                # 立即触发一次供给器，让它重新分配
                 threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
         except Exception as e:
             print(f"[多出口] 出口健康检测异常: {e}", flush=True)

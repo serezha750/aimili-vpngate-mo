@@ -121,7 +121,14 @@ TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 15, 1)
 OPENVPN_TEST_CONCURRENCY = env_int("OPENVPN_TEST_CONCURRENCY", 7, 1, 64)
+# ---------- 新增：publicvpnlist 独立并发数 ----------
+PUBLICVPNLIST_TEST_CONCURRENCY = env_int("PUBLICVPNLIST_TEST_CONCURRENCY", 30, 1, 128)
 TCP_PRESCREEN_CONCURRENCY = env_int("TCP_PRESCREEN_CONCURRENCY", 100, 1, 512)
+# ---------- publicvpnlist 自动导入配置 ----------
+PUBLICVPNLIST_SCRIPT = Path(__file__).parent / "download_and_import.py"
+PUBLICVPNLIST_INTERVAL = env_int("PUBLICVPNLIST_INTERVAL", 7200, 1)   # 默认2小时
+PUBLICVPNLIST_LAST_RUN = 0.0
+PUBLICVPNLIST_LOCK = threading.Lock()
 
 # ---- 多出口（住宅 IP 槽位）配置 ----
 # 每个槽位 = 一条独立 OpenVPN 隧道(tun{DEV_BASE+i}) + 独立策略路由表({TABLE_BASE+i}) + 独立本地代理端口({PORT_BASE+i})
@@ -1542,7 +1549,7 @@ def tcp_prescreen_dead(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         list(executor.map(probe, tcp_nodes))
     return dead
 
-def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
+def test_multiple_nodes(node_ids: list[str], max_workers: int | None = None) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
@@ -1552,6 +1559,11 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     if dead_prescreen:
         print(f"[分层测速] TCP 预筛淘汰 {len(dead_prescreen)} 个不可达节点，剩余 {len(to_test) - len(dead_prescreen)} 个进入 OpenVPN 测试", flush=True)
     to_test = [n for n in to_test if n.get("id") not in dead_prescreen]
+
+    # 确定并发数：若未指定则使用全局默认，否则使用传入值
+    if max_workers is None:
+        max_workers = OPENVPN_TEST_CONCURRENCY
+    max_workers = min(max_workers, max(1, len(to_test)))
 
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
@@ -1614,7 +1626,6 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
         return temp_node
 
     updated_nodes_map = dict(dead_prescreen)
-    max_workers = min(OPENVPN_TEST_CONCURRENCY, max(1, len(to_test)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(test_worker, (idx, n)): n["id"] for idx, n in enumerate(to_test)}
         for future in concurrent.futures.as_completed(futures):
@@ -1899,6 +1910,134 @@ def connect_node(node_id: str) -> str:
     finally:
         with lock:
             is_connecting = False
+            
+# ========== publicvpnlist 自动导入与检测 ==========
+def _import_publicvpnlist_nodes() -> list[str]:
+    """扫描 publicvpnlist-ovpn 目录，将 .ovpn 文件导入 nodes.json，返回新增节点ID列表"""
+    ovpn_dir = Path("./publicvpnlist-ovpn")
+    if not ovpn_dir.exists():
+        return []
+
+    nodes_json = Path("vpngate_data/nodes.json")
+    if not nodes_json.exists():
+        return []
+
+    with lock:
+        try:
+            with open(nodes_json, "r", encoding="utf-8") as f:
+                nodes = json.load(f)
+        except Exception:
+            return []
+        existing_ids = {n["id"] for n in nodes}
+
+    new_ids = []
+    prefix = "publicvpnlist_"
+    for ovpn_file in ovpn_dir.glob("*.ovpn"):
+        try:
+            config = ovpn_file.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        # 提取 remote 行
+        remote_line = None
+        for line in config.splitlines():
+            if line.strip().startswith("remote "):
+                remote_line = line.strip()
+                break
+        if not remote_line:
+            continue
+        parts = remote_line.split()
+        if len(parts) < 3:
+            continue
+        remote_host = parts[1]
+        try:
+            remote_port = int(parts[2])
+        except ValueError:
+            remote_port = 443
+        proto = parts[3].lower() if len(parts) > 3 else "tcp"
+
+        node_id = prefix + ovpn_file.stem
+        if node_id in existing_ids:
+            continue
+
+        node = {
+            "id": node_id,
+            "country": "",
+            "country_short": "",
+            "ip": remote_host,
+            "remote_host": remote_host,
+            "remote_port": remote_port,
+            "proto": proto,
+            "config_text": config,
+            "config_file": f"vpngate_data/configs/{node_id}.ovpn",
+            "score": 0,
+            "ping": 0,
+            "speed": 0,
+            "sessions": 0,
+            "latency_ms": 0,
+            "probe_status": "not_checked",
+            "probe_message": "",
+            "probed_at": 0,
+            "owner": "",
+            "asn": "",
+            "as_name": "",
+            "location": "",
+            "ip_type": "",
+            "quality": "",
+            "fetched_at": time.time(),
+            "source": "publicvpnlist_manual"
+        }
+        nodes.append(node)
+        existing_ids.add(node_id)
+        new_ids.append(node_id)
+
+    if new_ids:
+        with lock:
+            with open(nodes_json, "w", encoding="utf-8") as f:
+                json.dump(nodes, f, ensure_ascii=False, indent=2)
+        print(f"[publicvpnlist] 已导入 {len(new_ids)} 个新节点", flush=True)
+
+    return new_ids
+
+def run_publicvpnlist_import_and_test() -> None:
+    """后台执行 publicvpnlist 下载导入，并立即测试新增节点（使用独立并发数）"""
+    if not PUBLICVPNLIST_SCRIPT.exists():
+        return
+
+    with PUBLICVPNLIST_LOCK:
+        global PUBLICVPNLIST_LAST_RUN
+        now = time.time()
+        if now - PUBLICVPNLIST_LAST_RUN < PUBLICVPNLIST_INTERVAL:
+            return
+        PUBLICVPNLIST_LAST_RUN = now
+
+    def _task() -> None:
+        try:
+            print("[publicvpnlist] 开始后台下载与导入...", flush=True)
+            import subprocess
+            # 只下载（--skip-import），随后手动导入
+            proc = subprocess.Popen(
+                [sys.executable, str(PUBLICVPNLIST_SCRIPT), "--skip-import"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = proc.communicate(timeout=600)  # 10分钟超时
+            if proc.returncode != 0:
+                print(f"[publicvpnlist] 下载失败: {stderr}", flush=True)
+                return
+
+            # 导入并获取新增节点ID
+            new_ids = _import_publicvpnlist_nodes()
+            if new_ids:
+                print(f"[publicvpnlist] 发现 {len(new_ids)} 个新节点，开始独立并发检测 (并发数: {PUBLICVPNLIST_TEST_CONCURRENCY})...", flush=True)
+                # 调用全局测试函数，强制使用独立并发数
+                test_multiple_nodes(new_ids, max_workers=PUBLICVPNLIST_TEST_CONCURRENCY)
+                print(f"[publicvpnlist] 新节点检测完成", flush=True)
+        except Exception as e:
+            print(f"[publicvpnlist] 后台任务异常: {e}", flush=True)
+
+    threading.Thread(target=_task, daemon=True).start()
 
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
@@ -2070,6 +2209,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
     except Exception as e:
         raise e
     finally:
+        # 触发 publicvpnlist 自动导入（异步）
+        run_publicvpnlist_import_and_test()
         is_connecting = False
         maintenance_lock.release()
 

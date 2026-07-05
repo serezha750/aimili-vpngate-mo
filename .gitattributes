@@ -1,4 +1,0 @@
-# 统一行尾为 LF：本项目在 Linux 上以 bash/python 运行，避免 Windows 编辑引入 CRLF 破坏脚本
-* text=auto eol=lf
-*.sh text eol=lf
-*.py text eol=lf

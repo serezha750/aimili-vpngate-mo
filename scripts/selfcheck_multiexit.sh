@@ -94,3 +94,4 @@ done
 echo "--------------------------------------------"
 echo "${BLUE}自检结果:${PLAIN} ${GREEN}通过 ${PASS}${PLAIN} / ${RED}异常 ${FAIL}${PLAIN}"
 [ "$FAIL" = 0 ]
+

@@ -668,6 +668,3 @@ function createSemaphore(max) {
     await sleep(LOOP_INTERVAL_SECONDS * 1000);
   }
 })();
-
-
-检测我的代码

@@ -11,6 +11,9 @@ import signal
 from pathlib import Path
 from typing import Any
 from collections import defaultdict
+import socket
+import ipaddress
+import subprocess
 
 import vpn_utils
 import proxy_server
@@ -19,8 +22,6 @@ import config
 import state
 import utils
 import openvpn
-import subprocess
-import ipaddress      # 新增用于 IP 校验
 
 # ---------- 槽位全局变量 ----------
 exit_slots_lock = threading.RLock()
@@ -34,7 +35,6 @@ last_slot_egress_heartbeat = 0.0
 
 # ---------- 历史管理 ----------
 def load_slot_history() -> dict[str, list[str]]:
-    """加载每个槽位使用过的节点ID列表"""
     if not config.SLOT_HISTORY_FILE.exists():
         return {}
     try:
@@ -48,14 +48,12 @@ def save_slot_history(history: dict[str, list[str]]) -> None:
         json.dump(history, f, indent=2)
 
 def get_used_nodes(history: dict[str, list[str]]) -> set[str]:
-    """获取所有已使用过的节点ID集合（全局去重）"""
     used = set()
     for ids in history.values():
         used.update(ids)
     return used
 
 def record_node_used(slot: int, node_id: str) -> None:
-    """记录某个槽位使用了某个节点"""
     history = load_slot_history()
     key = str(slot)
     if key not in history:
@@ -65,7 +63,6 @@ def record_node_used(slot: int, node_id: str) -> None:
     save_slot_history(history)
 
 def reset_slot_history(slot: int = None) -> None:
-    """重置历史记录，若指定slot则只重置该槽位，否则全部清空"""
     if slot is None:
         if config.SLOT_HISTORY_FILE.exists():
             config.SLOT_HISTORY_FILE.unlink()
@@ -378,10 +375,15 @@ def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_o
     pool.sort(key=lambda n: (utils.parse_int(n.get("latency_ms")) or 999999, -utils.parse_int(n.get("score"))))
     return pool[:need]
 
+# ---------- 代理启动与拆除 ----------
 def ensure_slot_proxy(i: int) -> None:
     with exit_slots_lock:
         if i in exit_slot_proxy_stops:
-            return
+            stop_ev = exit_slot_proxy_stops[i]
+            if not stop_ev.is_set():
+                return
+            else:
+                del exit_slot_proxy_stops[i]
         stop_ev = threading.Event()
         exit_slot_proxy_stops[i] = stop_ev
     threading.Thread(
@@ -389,6 +391,43 @@ def ensure_slot_proxy(i: int) -> None:
         args=(config.SLOT_PROXY_HOST, slot_port(i), slot_device(i), stop_ev),
         daemon=True,
     ).start()
+
+# ---------- 启动时出口验证（带重试，类似 manager.py 的 check_proxy_health） ----------
+def wait_for_proxy_ready(port: int, max_attempts: int = 3, timeout_per_attempt: float = 5.0) -> tuple[bool, str]:
+    """循环尝试多个端点，直到成功或超过最大尝试次数。返回 (ok, ip)"""
+    endpoints = [
+        "http://ip.sb",
+        "http://api.ipify.org",
+        "https://icanhazip.com",
+        "http://ifconfig.me",
+    ]
+    for attempt in range(max_attempts):
+        for url in endpoints:
+            try:
+                res = subprocess.run(
+                    ["curl", "-s", "-x", f"socks5h://127.0.0.1:{port}", url,
+                     "--max-time", str(timeout_per_attempt), "-w", "%{http_code}"],
+                    capture_output=True, text=True, timeout=timeout_per_attempt + 1,
+                )
+                if res.returncode != 0:
+                    continue
+                stdout = res.stdout.strip()
+                if len(stdout) < 3:
+                    continue
+                http_code = stdout[-3:]
+                body = stdout[:-3].strip()
+                if http_code == "200" and body:
+                    try:
+                        ip = ipaddress.ip_address(body)
+                        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified):
+                            return True, str(ip)
+                    except ValueError:
+                        continue
+            except Exception:
+                continue
+        if attempt + 1 < max_attempts:
+            time.sleep(0.5)  # 重试间隔
+    return False, ""
 
 def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
     dev = slot_device(i)
@@ -408,7 +447,6 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
     )
     if not ok or process is None:
         print(f"[多出口] 槽位 {i} 节点 {node.get('id')} 连接失败: {message}", flush=True)
-        # 将节点加入冷却，避免反复尝试
         node_id = node.get('id')
         if node_id:
             slot_bad_nodes[node_id] = time.time() + config.SLOT_BAD_NODE_COOLDOWN
@@ -422,6 +460,39 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
 
     openvpn.setup_policy_routing(dev, slot_table(i))
     ensure_slot_proxy(i)
+
+    # 等待代理端口 TCP 就绪（快速检查）
+    tcp_ready = False
+    for _ in range(10):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(("127.0.0.1", slot_port(i)))
+            sock.close()
+            tcp_ready = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    if not tcp_ready:
+        print(f"[多出口] 槽位 {i} 代理端口 {slot_port(i)} 无法在 5 秒内就绪，视为失败", flush=True)
+        tear_down_slot(i, stop_proxy=True)
+        return False
+
+    # 现在执行实际的出口验证（类似 manager.py 的 check_proxy_health），重试 3 次，每次超时 5s
+    egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=3, timeout_per_attempt=5.0)
+    if not egress_ok:
+        print(f"[多出口] 槽位 {i} 出口验证失败（多次尝试后仍不可用），节点 {node.get('id')} 不可用，拆除槽位", flush=True)
+        node_id = node.get('id')
+        if node_id:
+            slot_bad_nodes[node_id] = time.time() + config.SLOT_BAD_NODE_COOLDOWN
+            print(f"[多出口] 节点 {node_id} 已加入冷却 {config.SLOT_BAD_NODE_COOLDOWN}s", flush=True)
+        reset_slot_history(i)
+        tear_down_slot(i, stop_proxy=True)
+        return False
+    else:
+        print(f"[多出口] 槽位 {i} 出口验证通过，出口 IP: {egress_ip}", flush=True)
+
+    # 所有检查通过，记录状态
     with exit_slots_lock:
         exit_slots[i] = {
             "slot": i, "device": dev, "table": slot_table(i), "port": slot_port(i),
@@ -431,10 +502,12 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
             "ip_type": node.get("ip_type"), "location": node.get("location"),
             "owner": node.get("owner"), "latency_ms": node.get("latency_ms"),
             "process": process, "status": "up", "since": time.time(), "message": "",
+            "exit_ip": egress_ip,
+            "egress_ok": True,
         }
     record_node_used(i, node.get("id"))
-    print(f"[多出口] 槽位 {i} 已就绪: {node.get('country')} {node.get('ip')} -> 代理 127.0.0.1:{slot_port(i)} (设备 {dev})", flush=True)
-    utils.log_to_json("INFO", "MultiExit", f"槽位 {i} 就绪: {node.get('country')} {node.get('ip')} 端口 {slot_port(i)}")
+    print(f"[多出口] 槽位 {i} 已就绪: {node.get('country')} {node.get('ip')} -> 代理 127.0.0.1:{slot_port(i)} (设备 {dev}) 出口IP {egress_ip}", flush=True)
+    utils.log_to_json("INFO", "MultiExit", f"槽位 {i} 就绪: {node.get('country')} {node.get('ip')} 端口 {slot_port(i)} 出口IP {egress_ip}")
     return True
 
 def mark_slot_pending(i: int, reason: str) -> None:
@@ -470,6 +543,7 @@ def tear_down_slot(i: int, stop_proxy: bool = True) -> None:
         pass
     if stop_proxy and stop_ev is not None:
         stop_ev.set()
+        time.sleep(0.2)
         print(f"[多出口] 槽位 {i} 已拆除（含代理端口 {slot_port(i)}）", flush=True)
 
 def slot_process_alive(i: int) -> bool:
@@ -528,6 +602,34 @@ def build_3xui_outbounds() -> dict[str, Any]:
         "routing": {"rules": rules},
     }
 
+# ---------- 核心：自动切换（含多级回退选择） ----------
+def _select_with_fallback(used_ids: set[str], country: str, residential_only: bool, isp: str) -> dict[str, Any] | None:
+    """尝试多级回退选择节点，返回第一个成功的节点，若全部失败返回 None"""
+    # 第一轮：严格过滤 + 排除历史
+    candidates = select_slot_nodes(used_ids, 1, country, residential_only, isp, exclude_history=True)
+    if candidates:
+        return candidates[0]
+
+    # 第二轮：清除历史重试
+    reset_slot_history()  # 清空所有历史，避免永久排除
+    candidates = select_slot_nodes(used_ids, 1, country, residential_only, isp, exclude_history=False)
+    if candidates:
+        return candidates[0]
+
+    # 第三轮：放宽过滤（忽略运营商和住宅类型，保留地区）
+    candidates = select_slot_nodes(used_ids, 1, country, False, "", exclude_history=False)
+    if candidates:
+        print(f"[多出口] 未找到符合运营商/住宅要求的节点，已放宽过滤条件", flush=True)
+        return candidates[0]
+
+    # 第四轮：彻底忽略所有过滤（仅排除坏节点和当前已用节点）
+    candidates = select_slot_nodes(used_ids, 1, "", False, "", exclude_history=False)
+    if candidates:
+        print(f"[多出口] 未找到符合地区要求的节点，已忽略所有过滤条件", flush=True)
+        return candidates[0]
+
+    return None
+
 def supervise_exit_slots_once() -> None:
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
@@ -535,6 +637,7 @@ def supervise_exit_slots_once() -> None:
         active = set(get_active_slots())
         paused = get_paused_slots() & active
 
+        # 拆除不在 active 中的槽位
         with exit_slots_lock:
             known_indices = sorted(set(exit_slots.keys()) | set(exit_slot_proxy_stops.keys()))
         for i in known_indices:
@@ -549,9 +652,6 @@ def supervise_exit_slots_once() -> None:
             write_slots_state()
             return
 
-        reserved_node_ids = set(current_slot_node_ids())
-        tasks = []
-
         slot_residential_only = get_exit_slot_config().get('residential_only', True)
         global_country = get_exit_slot_config().get('country', '')
         global_isp = get_exit_slot_config().get('isp', '')
@@ -563,6 +663,7 @@ def supervise_exit_slots_once() -> None:
                 mark_slot_paused(i)
                 continue
 
+            # 检查现有连接是否有效
             if slot_process_alive(i):
                 with exit_slots_lock:
                     s = exit_slots.get(i)
@@ -570,65 +671,28 @@ def supervise_exit_slots_once() -> None:
                 if current_node_id:
                     if node_status_map.get(current_node_id) != "available":
                         print(f"[多出口] 槽位 {i} 的节点 {current_node_id} 已失效，强制拆除并重新分配", flush=True)
+                        reset_slot_history(i)
                         tear_down_slot(i, stop_proxy=True)
                     else:
                         continue
                 else:
                     tear_down_slot(i, stop_proxy=True)
+            else:
+                tear_down_slot(i, stop_proxy=False)
 
-            tear_down_slot(i, stop_proxy=False)
-
+            # 此时槽位已拆除，重新选择节点
             country = per_slot_country(i) or global_country
             isp = per_slot_isp(i) or global_isp
+            used = set(current_slot_node_ids())
 
-            # 使用 select_slot_nodes 选择节点（自动排除坏节点和历史记录）
-            candidates = select_slot_nodes(
-                used_ids=reserved_node_ids,
-                need=1,
-                country=country,
-                residential_only=slot_residential_only,
-                isp=isp,
-                exclude_history=True
-            )
-            if candidates:
-                candidate = candidates[0]
-                reserved_node_ids.add(candidate['id'])
-                tasks.append((i, candidate))
-            else:
-                # 若无候选，清空历史并重试（忽略历史）
-                reset_slot_history()
-                candidates = select_slot_nodes(
-                    used_ids=reserved_node_ids,
-                    need=1,
-                    country=country,
-                    residential_only=slot_residential_only,
-                    isp=isp,
-                    exclude_history=False
-                )
-                if candidates:
-                    candidate = candidates[0]
-                    reserved_node_ids.add(candidate['id'])
-                    tasks.append((i, candidate))
+            candidate = _select_with_fallback(used, country, slot_residential_only, isp)
+            if candidate:
+                if bring_up_slot(i, candidate):
+                    continue
                 else:
-                    mark_slot_pending(i, f"暂无可用节点（{country or '不限地区'}），等待节点池补齐")
-
-        max_parallel = min(20, len(tasks))
-        if tasks:
-            print(f"[多出口] 共 {len(tasks)} 个槽位待启动，并发数 {max_parallel}...", flush=True)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
-                future_to_slot = {
-                    executor.submit(_bring_up_wrapper, i, node): i
-                    for i, node in tasks
-                }
-                for future in concurrent.futures.as_completed(future_to_slot):
-                    idx = future_to_slot[future]
-                    try:
-                        ok = future.result()
-                        if not ok:
-                            mark_slot_pending(idx, "并发启动连接失败，待重试")
-                    except Exception as e:
-                        print(f"[多出口] 槽位 {idx} 并发启动异常: {e}", flush=True)
-                        mark_slot_pending(idx, f"启动异常: {e}")
+                    mark_slot_pending(i, f"启动节点 {candidate['id']} 失败")
+            else:
+                mark_slot_pending(i, f"无任何可用节点（过滤条件过于严格或节点池为空）")
 
         write_slots_state()
     finally:
@@ -725,31 +789,20 @@ def add_slot_with_node(node_id: str) -> dict[str, Any]:
     return result
 
 def rotate_exit_slots(count: int, country: str = "", isp: str = "", residential_only: bool = True) -> dict[str, Any]:
-    """设置槽位数量并全量轮换，确保每个槽位使用未被任何槽位使用过的节点"""
-    # 先设置槽位配置
     result = set_exit_slot_config(count=count, country=country, residential_only=residential_only, isp=isp)
     if result.get("count", 0) == 0:
         return {"ok": True, "message": "出口已关闭"}
-    
-    # 强制重新分配所有槽位，使用历史排除
     with exit_slots_supervise_lock:
-        # 拆除所有现有槽位
         for i in list(exit_slots.keys()):
             tear_down_slot(i, stop_proxy=True)
-        # 重新启动
         supervise_exit_slots_once()
     return {"ok": True, "message": f"已重新分配 {count} 个出口，每个使用不同IP"}
 
-# ========== 修复后的出口检测函数 ==========
+# ========== 出口持续健康检测 ==========
 def check_slot_egress(port: int) -> tuple[bool, str]:
-    """
-    通过 SOCKS5 代理检测出口是否可用。
-    依次尝试多个公网 IP 查询端点，严格验证返回的是公网 IP 地址且 HTTP 状态码为 200。
-    """
     endpoints = ["https://icanhazip.com", "http://ip.sb", "http://api.ipify.org", "http://ifconfig.me", "https://cip.cc"]
     for url in endpoints:
         try:
-            # 使用 -w 获取 HTTP 状态码，并分离响应体
             res = subprocess.run(
                 ["curl", "-s", "-x", f"socks5h://127.0.0.1:{port}", url,
                  "--max-time", "6", "-w", "%{http_code}"],
@@ -757,27 +810,19 @@ def check_slot_egress(port: int) -> tuple[bool, str]:
             )
             if res.returncode != 0:
                 continue
-
             stdout = res.stdout.strip()
             if len(stdout) < 3:
                 continue
-
-            # 取最后 3 位作为状态码，前面部分为响应体
             http_code = stdout[-3:]
             body = stdout[:-3].strip()
-
             if http_code != "200" or not body:
                 continue
-
-            # 严格验证是否为公网 IP（IPv4 或 IPv6）
             try:
                 ip = ipaddress.ip_address(body)
-                # 排除私有、回环、链路本地等非公网地址
                 if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
                     continue
                 return True, str(ip)
             except ValueError:
-                # 不是有效的 IP 地址
                 continue
         except Exception:
             continue
@@ -812,6 +857,7 @@ def slot_egress_checker_loop() -> None:
                 slot_egress_fail_counts[i] = 0
                 if nid:
                     slot_bad_nodes[nid] = time.time() + config.SLOT_BAD_NODE_COOLDOWN
+                    reset_slot_history(i)
                 print(f"[多出口] 槽位 {i} 节点 {nid} 出口不通，强制拆除并切换", flush=True)
                 utils.log_to_json("WARNING", "MultiExit", f"槽位 {i} 节点 {nid} 出口不通，强制漂移")
                 tear_down_slot(i, stop_proxy=True)

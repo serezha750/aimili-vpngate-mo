@@ -31,7 +31,7 @@ let proxyPortBase = 17928;
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ---------- API 封装（同上） ----------
+// ---------- API 封装 ----------
 async function loginAimili() {
   try {
     const res = await axios.post(`${AIMILIVPN_BASE}/api/login`, {
@@ -84,7 +84,7 @@ async function startSlot(slot)       { return apiRequest('post', '/api/start_slo
 async function assignNodeToSlot(slot, nodeId) { return apiRequest('post', '/api/assign_slot_node', { slot, node_id: nodeId }); }
 async function getNodes()            { const res = await apiRequest('get', '/api/nodes'); return res.nodes || []; }
 
-// ---------- 节点池管理器（随机分配） ----------
+// ---------- 节点池管理器（支持刷新） ----------
 class NodePool {
   constructor(nodes) {
     this.nodes = nodes.filter(n => n.probe_status === 'available');
@@ -93,14 +93,27 @@ class NodePool {
     console.log(`📦 节点池初始化: 共 ${this.nodes.length} 个可用节点`);
   }
 
+  // 刷新节点池：根据最新节点列表更新 nodes，并清理已失效的 used 节点
+  async refresh(nodes) {
+    const now = Date.now();
+    const availableIds = new Set(nodes.filter(n => n.probe_status === 'available').map(n => n.id));
+    // 更新节点列表
+    this.nodes = nodes.filter(n => availableIds.has(n.id));
+    // 从 used 中移除已失效的节点
+    for (const id of this.used) {
+      if (!availableIds.has(id)) {
+        this.used.delete(id);
+      }
+    }
+    console.log(`🔄 节点池刷新: 当前可用 ${this.nodes.length} 个，已使用 ${this.used.size} 个`);
+  }
+
   async acquire() {
     while (this.lock) await sleep(50);
     this.lock = true;
-    // 获取所有未使用节点
     const available = this.nodes.filter(n => !this.used.has(n.id));
     let node = null;
     if (available.length > 0) {
-      // 随机选取一个
       const randomIndex = Math.floor(Math.random() * available.length);
       node = available[randomIndex];
       this.used.add(node.id);
@@ -552,6 +565,16 @@ function createSemaphore(max) {
   const allResults = [];
 
   const processSlot = async (slot, roundNum, nodePool) => {
+    // 在开始处理前刷新节点池（从 API 获取最新可用节点）
+    try {
+      const latestNodes = await getNodes();
+      if (latestNodes && latestNodes.length > 0) {
+        await nodePool.refresh(latestNodes);
+      }
+    } catch (e) {
+      console.warn(`⚠️ 刷新节点池失败: ${e.message}，继续使用现有池`);
+    }
+
     console.log(`\n🔄 第 ${roundNum} 轮，槽位 ${slot} 开始处理...`);
 
     for (let retry = 1; retry <= MAX_IP_RETRY; retry++) {
@@ -662,8 +685,8 @@ function createSemaphore(max) {
         continue;
       }
 
-      const nodes = await getNodes();
-      const availableNodes = nodes.filter(n => n.probe_status === 'available');
+      const initialNodes = await getNodes();
+      const availableNodes = initialNodes.filter(n => n.probe_status === 'available');
       if (availableNodes.length === 0) {
         console.log('⚠️ 没有可用的节点，等待重试...');
         await sleep(60000);

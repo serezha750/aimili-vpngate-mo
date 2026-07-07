@@ -392,6 +392,37 @@ def ensure_slot_proxy(i: int) -> None:
         daemon=True,
     ).start()
 
+# ========== 新增：强制释放 tun 设备 ==========
+def release_tun_device(dev: str) -> None:
+    """强制释放指定的 tun 设备：杀掉占用进程并删除设备"""
+    try:
+        # 查找占用该设备的 openvpn 进程
+        result = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "openvpn" in line and f"--dev {dev}" in line:
+                parts = line.split()
+                if parts:
+                    pid = int(parts[0])
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        time.sleep(0.2)
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    except OSError:
+                        pass
+    except Exception as e:
+        print(f"[release_tun_device] 查找进程失败: {e}")
+
+    # 尝试删除设备
+    try:
+        subprocess.run(["ip", "tuntap", "del", dev, "mode", "tun"],
+                       stderr=subprocess.DEVNULL, timeout=2)
+        print(f"[release_tun_device] 已删除设备 {dev}")
+    except Exception:
+        pass
+
 # ---------- 启动时出口验证（带重试，类似 manager.py 的 check_proxy_health） ----------
 def wait_for_proxy_ready(port: int, max_attempts: int = 3, timeout_per_attempt: float = 5.0) -> tuple[bool, str]:
     """循环尝试多个端点，直到成功或超过最大尝试次数。返回 (ok, ip)"""
@@ -429,8 +460,12 @@ def wait_for_proxy_ready(port: int, max_attempts: int = 3, timeout_per_attempt: 
             time.sleep(0.5)  # 重试间隔
     return False, ""
 
+# ---------- 核心：bring_up_slot（含释放设备与重试） ----------
 def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
     dev = slot_device(i)
+    # ----- 启动前强制释放设备 -----
+    release_tun_device(dev)
+
     cfg_path = slot_config_path(i)
     try:
         config.CONFIG_DIR.mkdir(exist_ok=True, parents=True)
@@ -445,6 +480,18 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
         timeout=config.OPENVPN_TEST_TIMEOUT_SECONDS, dev=dev, extra_args=extra,
         report_status=False,
     )
+
+    # ----- 若启动失败且因设备繁忙，则释放并重试一次 -----
+    if not ok or process is None:
+        if "Device or resource busy" in message or "errno=16" in message:
+            print(f"[多出口] 槽位 {i} 启动因设备繁忙失败，尝试释放设备并重试...", flush=True)
+            release_tun_device(dev)
+            ok, message, process = openvpn.run_openvpn_until_ready(
+                str(cfg_path), keep_alive=True, route_nopull=True,
+                timeout=config.OPENVPN_TEST_TIMEOUT_SECONDS, dev=dev, extra_args=extra,
+                report_status=False,
+            )
+
     if not ok or process is None:
         print(f"[多出口] 槽位 {i} 节点 {node.get('id')} 连接失败: {message}", flush=True)
         node_id = node.get('id')
@@ -478,7 +525,7 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
         tear_down_slot(i, stop_proxy=True)
         return False
 
-    # 现在执行实际的出口验证（类似 manager.py 的 check_proxy_health），重试 3 次，每次超时 5s
+    # 执行出口验证，重试 3 次
     egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=3, timeout_per_attempt=5.0)
     if not egress_ok:
         print(f"[多出口] 槽位 {i} 出口验证失败（多次尝试后仍不可用），节点 {node.get('id')} 不可用，拆除槽位", flush=True)
@@ -545,6 +592,14 @@ def tear_down_slot(i: int, stop_proxy: bool = True) -> None:
         stop_ev.set()
         time.sleep(0.2)
         print(f"[多出口] 槽位 {i} 已拆除（含代理端口 {slot_port(i)}）", flush=True)
+
+    # ----- 新增：删除 tun 设备 -----
+    dev = slot_device(i)
+    try:
+        subprocess.run(["ip", "tuntap", "del", dev, "mode", "tun"],
+                       stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
 
 def slot_process_alive(i: int) -> bool:
     with exit_slots_lock:

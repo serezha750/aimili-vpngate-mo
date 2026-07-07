@@ -51,6 +51,8 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0", ext
             "--dev-type", "tun",
             "--pull-filter", "ignore", "route-ipv6",
             "--pull-filter", "ignore", "ifconfig-ipv6",
+            "--pull-filter", "ignore", "dhcp-option", 
+            "--pull-filter", "ignore", "redirect-gateway",
             "--route-delay", "2",
             "--connect-retry-max", "1",
             "--auth-user-pass", str(config.AUTH_FILE),

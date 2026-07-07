@@ -169,6 +169,7 @@ def tcp_prescreen_dead(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]
         list(executor.map(probe, tcp_nodes))
     return dead
 
+# ========== 修改后的 test_multiple_nodes（支持删除 TCP 预筛死节点） ==========
 def test_multiple_nodes(node_ids: list[str], max_workers: int | None = None) -> list[dict[str, Any]]:
     with state.lock:
         nodes = state.read_nodes()
@@ -266,16 +267,28 @@ def test_multiple_nodes(node_ids: list[str], max_workers: int | None = None) -> 
         except Exception as ee:
             print(f"[test_multiple_nodes] 批量富化 IP 失败: {ee}", flush=True)
 
+    # ===== 删除 TCP 预筛死节点（受配置开关控制） =====
     with state.lock:
         current_nodes = state.read_nodes()
+        dead_ids = set(dead_prescreen.keys())
+
+        # 如果配置了删除（默认 True，可通过环境变量 DELETE_PRESCREEN_DEAD=1 开启）
+        if getattr(config, 'DELETE_PRESCREEN_DEAD', True):
+            # 从当前节点列表中过滤掉 dead_ids
+            current_nodes = [n for n in current_nodes if n.get("id") not in dead_ids]
+            print(f"[分层测速] 已从节点池中删除 {len(dead_ids)} 个 TCP 预筛不可达节点", flush=True)
+
+        # 更新剩余节点的状态（跳过已删除的节点）
         for n in current_nodes:
             nid = n.get("id")
-            if nid in updated_nodes_map:
+            if nid in updated_nodes_map and nid not in dead_ids:
                 n.update(updated_nodes_map[nid])
+
         sorted_nodes = sort_all_nodes(current_nodes)
         state.write_json(config.NODES_FILE, sorted_nodes)
 
     return list(updated_nodes_map.values())
+# ===== 修改结束 =====
 
 def mark_main_bad_node(node_id: str) -> None:
     nid = str(node_id or "").strip()
@@ -562,7 +575,6 @@ def active_openvpn_running() -> bool:
     return state.active_openvpn_process is not None and state.active_openvpn_process.poll() is None
 
 # ---------- publicvpnlist 自动导入 ----------
-# 全局变量，控制下载间隔和锁
 PUBLICVPNLIST_LAST_RUN = 0.0
 PUBLICVPNLIST_LOCK = threading.Lock()
 
@@ -571,13 +583,12 @@ def _import_publicvpnlist_nodes() -> list[str]:
     扫描 publicvpnlist-ovpn 目录，将新节点导入到 config.NODES_FILE 中。
     返回新增节点 ID 列表，并更新 state.json 中的导入计数和时间。
     """
-    # 使用绝对路径，避免相对路径歧义
     ovpn_dir = config.ROOT_DIR / "publicvpnlist-ovpn"
     if not ovpn_dir.exists():
         print(f"[publicvpnlist] 目录 {ovpn_dir} 不存在，跳过导入", flush=True)
         return []
 
-    nodes_json = config.NODES_FILE  # 使用配置的路径
+    nodes_json = config.NODES_FILE
     if not nodes_json.exists():
         print(f"[publicvpnlist] {nodes_json} 不存在，将创建", flush=True)
         nodes = []
@@ -603,7 +614,6 @@ def _import_publicvpnlist_nodes() -> list[str]:
             print(f"[publicvpnlist] 读取 {ovpn_file.name} 失败: {e}", flush=True)
             continue
 
-        # 提取 remote 行
         remote_line = None
         for line in config_text.splitlines():
             line_strip = line.strip()
@@ -625,9 +635,9 @@ def _import_publicvpnlist_nodes() -> list[str]:
             remote_port = 443
         proto = parts[3].lower() if len(parts) > 3 else "tcp"
 
-        node_id = prefix + ovpn_file.stem  # 文件名（不含扩展名）
+        node_id = prefix + ovpn_file.stem
         if node_id in existing_ids:
-            continue  # 已存在则跳过
+            continue
 
         node = {
             "id": node_id,
@@ -666,8 +676,6 @@ def _import_publicvpnlist_nodes() -> list[str]:
         with open(nodes_json, "w", encoding="utf-8") as f:
             json.dump(nodes, f, ensure_ascii=False, indent=2)
         print(f"[publicvpnlist] 成功导入 {len(new_ids)} 个新节点，当前节点总数: {len(nodes)}", flush=True)
-
-        # ========== 新增：更新 state.json 记录导入信息 ==========
         state.set_state(
             publicvpnlist_import_count=len(new_ids),
             publicvpnlist_import_time=time.time(),
@@ -678,21 +686,15 @@ def _import_publicvpnlist_nodes() -> list[str]:
     return new_ids
 
 def sync_publicvpnlist_import() -> int:
-    """
-    同步下载并导入 publicvpnlist 节点，返回新增节点数。
-    该函数会检查距上次下载是否超过配置间隔，若超时则执行下载。
-    """
     global PUBLICVPNLIST_LAST_RUN
     if not config.PUBLICVPNLIST_SCRIPT.exists():
         return 0
 
     with PUBLICVPNLIST_LOCK:
         now = time.time()
-        # 检查是否需要下载
         if now - PUBLICVPNLIST_LAST_RUN >= config.PUBLICVPNLIST_INTERVAL:
             PUBLICVPNLIST_LAST_RUN = now
             print("[publicvpnlist] 同步下载最新节点...", flush=True)
-            # 设置环境变量，让子进程输出到与导入相同的目录
             env = os.environ.copy()
             ovpn_dir = str(config.ROOT_DIR / "publicvpnlist-ovpn")
             env["OUT_DIR"] = ovpn_dir
@@ -712,13 +714,11 @@ def sync_publicvpnlist_import() -> int:
             except Exception as e:
                 print(f"[publicvpnlist] 下载异常: {e}", flush=True)
 
-        # 导入新节点（幂等）
         new_ids = _import_publicvpnlist_nodes()
         if new_ids:
             print(f"[publicvpnlist] 导入 {len(new_ids)} 个新节点", flush=True)
         return len(new_ids)
 
-# 保留旧异步函数（不再调用，但保留以防其他引用）
 def run_publicvpnlist_import_and_test() -> None:
     if not config.PUBLICVPNLIST_SCRIPT.exists():
         return
@@ -811,15 +811,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
             state.set_state(last_fetch_at=time.time(), last_fetch_status="error", last_fetch_message=diag_msg)
             candidates = []
 
-        # ===== 同步导入 publicvpnlist =====
         try:
             sync_publicvpnlist_import()
         except Exception as e:
             print(f"[publicvpnlist] 同步导入失败: {e}", flush=True)
 
-        if candidates or True:  # 即使没有候选节点，也要保留现有节点并测试
+        if candidates or True:
             with state.lock:
-                # 读取当前节点（此时已包含 publicvpnlist 导入的新节点）
                 current_nodes = state.read_nodes()
                 active_node = None
                 if state.active_openvpn_node_id:
@@ -828,18 +826,15 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 merged: list[dict[str, Any]] = []
                 seen_ids: set[str] = set()
 
-                # 优先保留当前节点（包括活动节点）
                 if active_node:
                     merged.append(active_node)
                     seen_ids.add(active_node["id"])
 
-                # 添加候选节点（去重）
                 for cand in candidates:
                     if cand["id"] not in seen_ids:
                         merged.append(cand)
                         seen_ids.add(cand["id"])
 
-                # 添加当前节点中尚未在合并列表中的节点（例如 publicvpnlist 新导入的）
                 for n in current_nodes:
                     if n["id"] not in seen_ids:
                         merged.append(n)
@@ -848,7 +843,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if len(merged) > 1000:
                     merged = merged[:1000]
 
-                # 确保配置文件存在
                 for n in merged:
                     config_path = Path(n["config_file"])
                     if not config_path.exists():
@@ -942,7 +936,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
     except Exception as e:
         raise e
     finally:
-        # 不再调用异步导入，因为已同步处理
         state.is_connecting = False
         state.maintenance_lock.release()
 

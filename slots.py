@@ -525,8 +525,8 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
         tear_down_slot(i, stop_proxy=True)
         return False
 
-    # 执行出口验证，重试 3 次
-    egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=3, timeout_per_attempt=5.0)
+    # 执行出口验证，重试 2 次
+    egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=2, timeout_per_attempt=5.0)
     if not egress_ok:
         print(f"[多出口] 槽位 {i} 出口验证失败（多次尝试后仍不可用），节点 {node.get('id')} 不可用，拆除槽位", flush=True)
         node_id = node.get('id')

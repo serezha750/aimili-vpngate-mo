@@ -941,128 +941,156 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
 # ---------- 代理健康检测 ----------
 def check_proxy_health() -> dict[str, Any]:
+    """检测本地代理出口是否可用。
+
+    优化点：
+    - 多端点并行探测，任一成功立即返回（降低误报与最坏等待时间）
+    - 单次 curl 超时缩短为约 3s
+    - 统一解析本机代理连接地址，减少重复逻辑
+    """
     is_ipv6 = ":" in config.LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    s = None
-    try:
-        s = socket.socket(af, socket.SOCK_STREAM)
-        s.settimeout(1.5)
-        connect_host = config.LOCAL_PROXY_HOST
-        if connect_host in ("::", "0.0.0.0", ""):
-            connect_host = "::1" if is_ipv6 else "127.0.0.1"
-        try:
-            s.connect((connect_host, config.LOCAL_PROXY_PORT))
-        except Exception as e:
-            if connect_host == "::1":
-                s.close()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(1.5)
-                s.connect(("127.0.0.1", config.LOCAL_PROXY_PORT))
-            else:
-                raise e
-    except Exception as e:
-        diag = vpn_utils.diagnose_local_obstructions(config.LOCAL_PROXY_PORT, host=config.LOCAL_PROXY_HOST)
-        diag_msg = diag[1] if diag else f"端口 {config.LOCAL_PROXY_PORT} 连接失败，原因: {e}"
-        return {
-            "ok": False,
-            "error": f"代理服务未运行 ({diag_msg})"
-        }
-    finally:
-        if s is not None:
+
+    def _local_proxy_connect_hosts() -> list[tuple[int, str]]:
+        """返回 [(address_family, host), ...] 按优先级尝试。"""
+        host = config.LOCAL_PROXY_HOST
+        if host in ("::", ""):
+            return [(socket.AF_INET6, "::1"), (socket.AF_INET, "127.0.0.1")]
+        if host == "0.0.0.0":
+            return [(socket.AF_INET, "127.0.0.1")]
+        if ":" in host:
+            return [(socket.AF_INET6, host), (socket.AF_INET, "127.0.0.1")]
+        return [(socket.AF_INET, host)]
+
+    def _proxy_url_hosts() -> list[str]:
+        host = config.LOCAL_PROXY_HOST
+        if host == "::":
+            return ["[::1]", "127.0.0.1"]
+        if host == "0.0.0.0":
+            return ["127.0.0.1"]
+        if ":" in host:
+            return [f"[{host}]", "127.0.0.1"]
+        return [host]
+
+    def _tcp_probe(timeout: float = 1.5) -> bool:
+        for af, connect_host in _local_proxy_connect_hosts():
+            s = None
             try:
-                s.close()
+                s = socket.socket(af, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((connect_host, config.LOCAL_PROXY_PORT))
+                return True
             except Exception:
-                pass
+                continue
+            finally:
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        return False
+
+    if not _tcp_probe(1.5):
+        diag = vpn_utils.diagnose_local_obstructions(config.LOCAL_PROXY_PORT, host=config.LOCAL_PROXY_HOST)
+        diag_msg = diag[1] if diag else f"端口 {config.LOCAL_PROXY_PORT} 连接失败"
+        return {"ok": False, "error": f"代理服务未运行 ({diag_msg})"}
 
     tun_path = Path("/sys/class/net/tun0")
     if sys.platform.startswith("linux") and not tun_path.exists():
         return {
             "ok": False,
-            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点"
+            "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点",
         }
 
-    def _curl_check_ip(url: str) -> dict[str, Any] | None:
-        proxy_hosts = []
-        if config.LOCAL_PROXY_HOST == "::":
-            proxy_hosts = ["[::1]", "127.0.0.1"]
-        elif config.LOCAL_PROXY_HOST == "0.0.0.0":
-            proxy_hosts = ["127.0.0.1"]
-        elif ":" in config.LOCAL_PROXY_HOST:
-            proxy_hosts = [f"[{config.LOCAL_PROXY_HOST}]", "127.0.0.1"]
-        else:
-            proxy_hosts = [config.LOCAL_PROXY_HOST]
+    # 多端点：任一成功即可；并行缩短最坏等待
+    health_endpoints = (
+        "http://api.ipify.org",
+        "http://ip.sb",
+        "http://ifconfig.me/ip",
+        "http://icanhazip.com",
+    )
+    curl_max_time = 3  # 秒
+    curl_proc_timeout = curl_max_time + 1
 
-        for p_host in proxy_hosts:
+    def _looks_like_ip(text: str) -> bool:
+        text = text.strip()
+        if not text or len(text) > 45:
+            return False
+        # 粗校验：IPv4 或 IPv6 字符集，避免把 HTML 错误页当 IP
+        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", text):
+            return True
+        if ":" in text and re.match(r"^[0-9a-fA-F:]+$", text):
+            return True
+        return False
+
+    def _curl_check_ip(url: str) -> dict[str, Any] | None:
+        proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
+        for p_host in _proxy_url_hosts():
             proxy_url = f"socks5h://{p_host}:{config.LOCAL_PROXY_PORT}"
-            proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
-                "curl", "-s",
+                "curl", "-s", "-L",
+                "--max-redirs", "2",
                 "-w", "\n%{time_total} %{http_code}",
                 "-x", proxy_url,
                 url,
-                "--max-time", "5"
+                "--max-time", str(curl_max_time),
             ]
             if proxy_user is not None and proxy_pass is not None:
                 cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
-                if res.returncode == 0:
-                    lines = res.stdout.strip().splitlines()
-                    if len(lines) >= 2:
-                        ip = lines[0].strip()
-                        time_info = lines[1].strip().split()
-                        if len(time_info) == 2:
-                            total_time_str, http_code = time_info
-                            if http_code == "200" and ip:
-                                latency_ms = int(float(total_time_str) * 1000)
-                                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=curl_proc_timeout)
+                if res.returncode != 0:
+                    continue
+                lines = res.stdout.strip().splitlines()
+                if len(lines) < 2:
+                    continue
+                ip = lines[0].strip()
+                time_info = lines[-1].strip().split()
+                if len(time_info) != 2:
+                    continue
+                total_time_str, http_code = time_info
+                if http_code != "200" or not _looks_like_ip(ip):
+                    continue
+                latency_ms = int(float(total_time_str) * 1000)
+                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
             except Exception:
-                pass
+                continue
         return None
 
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(health_endpoints))
     try:
-        result = _curl_check_ip("http://ip.sb")
-        if result:
-            return result
-        result = _curl_check_ip("http://api.ipify.org")
-        if result:
-            return result
-
-        port_still_listening = False
-        test_sock = None
+        # 并行探测；拿到第一个成功结果即返回，并尽快结束线程池等待
+        futures = {pool.submit(_curl_check_ip, url): url for url in health_endpoints}
         try:
-            test_sock = socket.socket(af, socket.SOCK_STREAM)
-            test_sock.settimeout(1.0)
-            connect_host = config.LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                test_sock.connect((connect_host, config.LOCAL_PROXY_PORT))
-                port_still_listening = True
-            except Exception:
-                if connect_host == "::1":
-                    test_sock.close()
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_sock.settimeout(1.0)
-                    test_sock.connect(("127.0.0.1", config.LOCAL_PROXY_PORT))
-                    port_still_listening = True
-        except Exception:
-            pass
-        finally:
-            if test_sock is not None:
+            for fut in concurrent.futures.as_completed(futures, timeout=curl_proc_timeout + 1):
                 try:
-                    test_sock.close()
+                    result = fut.result()
                 except Exception:
-                    pass
+                    continue
+                if result and result.get("ok"):
+                    return result
+        except concurrent.futures.TimeoutError:
+            pass
 
-        if not port_still_listening:
+        # 全部失败：再确认代理端口是否仍在监听，区分“代理挂了”和“出口不通”
+        if not _tcp_probe(1.0):
             diag = vpn_utils.diagnose_local_obstructions(config.LOCAL_PROXY_PORT, host=config.LOCAL_PROXY_HOST)
             if diag:
                 return {"ok": False, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
+            return {"ok": False, "error": f"出口连接测试失败 | 代理端口 {config.LOCAL_PROXY_PORT} 已不可达"}
 
-        return {"ok": False, "error": "出口连接测试失败 (ip.sb 和 api.ipify.org 均无法连通，可能是节点已失效或 VPS 防火墙限制了 UDP/TCP 出站端口)"}
+        tried = ", ".join(health_endpoints)
+        return {
+            "ok": False,
+            "error": (
+                f"出口连接测试失败（已并行尝试: {tried}；"
+                "可能是节点已失效、隧道不转发，或 VPS 防火墙限制了相关出站）"
+            ),
+        }
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
 
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting, main_egress_fail_count

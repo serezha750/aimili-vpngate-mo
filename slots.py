@@ -319,7 +319,7 @@ def get_exit_slot_config() -> dict[str, Any]:
         "paused": sorted(get_paused_slots() & set(active)),
         "country": str(cfg.get("exit_slot_country", "") or "").strip().upper(),
         "isp": str(cfg.get("exit_slot_isp", "") or "").strip(),
-        "residential_only": bool(cfg.get("exit_slot_residential_only", False)),
+        "residential_only": bool(cfg.get("exit_slot_residential_only", True)),
     }
 
 def set_exit_slot_config(count: Any = None, country: Any = None, residential_only: Any = None, isp: Any = None) -> dict[str, Any]:
@@ -486,16 +486,25 @@ def current_slot_node_ids() -> set[str]:
     with exit_slots_lock:
         return {s.get("node_id") for s in exit_slots.values() if s.get("node_id")}
 
-def pick_slot_node(i: int, used_ids: set[str]) -> dict[str, Any] | None:
-    pin = get_slot_pin_map().get(str(i))
+def pick_slot_node(i: int, used_ids: set[str], country: str | None = None, residential_only: bool | None = None, isp: str | None = None) -> dict[str, Any] | None:
+    """为槽位选择节点：优先使用 pin 锁定节点，否则走多级回退。"""
+    pin = get_slot_pin_map().get(str(i), "").strip()
     if pin and pin not in used_ids:
-        node = next((n for n in state.read_nodes()
-                     if n.get("id") == pin and n.get("probe_status") == "available"), None)
+        node = next(
+            (n for n in state.read_nodes()
+             if n.get("id") == pin and n.get("probe_status") == "available"),
+            None,
+        )
         if node:
             return node
+        # pin 节点不可用时不立刻清 pin，由调用方决定；继续回退以免槽位空置
+        print(f"[多出口] 槽位 {i} 锁定节点 {pin} 当前不可用，尝试回退选节点", flush=True)
+
     cfg = get_exit_slot_config()
-    picks = select_slot_nodes(used_ids, 1, per_slot_country(i), cfg["residential_only"], per_slot_isp(i))
-    return picks[0] if picks else None
+    c = country if country is not None else (per_slot_country(i) or cfg.get("country", ""))
+    r = cfg["residential_only"] if residential_only is None else residential_only
+    s = isp if isp is not None else (per_slot_isp(i) or cfg.get("isp", ""))
+    return _select_with_fallback(used_ids, c, r, s, slot=i)
 
 def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_only: bool, isp: str = "", exclude_history: bool = True) -> list[dict[str, Any]]:
     if need <= 0:
@@ -865,7 +874,7 @@ def write_slots_state() -> None:
     state.write_json(config.SLOTS_FILE, {
         "updated_at": time.time(), "desired_count": cfg["count"],
         "country": cfg["country"], "residential_only": cfg["residential_only"],
-        "proxy_host": "0.0.0.0", "slots": snapshot,
+        "proxy_host": config.SLOT_PROXY_HOST, "slots": snapshot,
     })
 
 def build_3xui_outbounds() -> dict[str, Any]:
@@ -888,29 +897,30 @@ def build_3xui_outbounds() -> dict[str, Any]:
     }
 
 # ---------- 核心：自动切换（含多级回退选择） ----------
-def _select_with_fallback(used_ids: set[str], country: str, residential_only: bool, isp: str) -> dict[str, Any] | None:
-    """尝试多级回退选择节点，返回第一个成功的节点，若全部失败返回 None"""
+def _select_with_fallback(used_ids: set[str], country: str, residential_only: bool, isp: str, slot: int | None = None) -> dict[str, Any] | None:
+    """多级回退选节点。不再全局清空历史；仅在指定 slot 时清除该槽历史后再试。"""
     # 第一轮：严格过滤 + 排除历史
     candidates = select_slot_nodes(used_ids, 1, country, residential_only, isp, exclude_history=True)
     if candidates:
         return candidates[0]
 
-    # 第二轮：清除历史重试
-    reset_slot_history()  # 清空所有历史，避免永久排除
+    # 第二轮：允许复用历史节点（若指定槽位则只清该槽历史，避免影响其它槽）
+    if slot is not None:
+        reset_slot_history(slot)
     candidates = select_slot_nodes(used_ids, 1, country, residential_only, isp, exclude_history=False)
     if candidates:
         return candidates[0]
 
-    # 第三轮：放宽过滤（忽略运营商和住宅类型，保留地区）
+    # 第三轮：放宽运营商/住宅，保留地区
     candidates = select_slot_nodes(used_ids, 1, country, False, "", exclude_history=False)
     if candidates:
-        print(f"[多出口] 未找到符合运营商/住宅要求的节点，已放宽过滤条件", flush=True)
+        print("[多出口] 未找到符合运营商/住宅要求的节点，已放宽过滤条件", flush=True)
         return candidates[0]
 
-    # 第四轮：彻底忽略所有过滤（仅排除坏节点和当前已用节点）
+    # 第四轮：忽略地区等全部过滤
     candidates = select_slot_nodes(used_ids, 1, "", False, "", exclude_history=False)
     if candidates:
-        print(f"[多出口] 未找到符合地区要求的节点，已忽略所有过滤条件", flush=True)
+        print("[多出口] 未找到符合地区要求的节点，已忽略所有过滤条件", flush=True)
         return candidates[0]
 
     return None
@@ -943,9 +953,10 @@ def supervise_exit_slots_once() -> None:
             write_slots_state()
             return
 
-        slot_residential_only = get_exit_slot_config().get('residential_only', True)
-        global_country = get_exit_slot_config().get('country', '')
-        global_isp = get_exit_slot_config().get('isp', '')
+        slot_cfg = get_exit_slot_config()
+        slot_residential_only = bool(slot_cfg.get('residential_only', True))
+        global_country = slot_cfg.get('country', '')
+        global_isp = slot_cfg.get('isp', '')
 
         need_bringup: list[int] = []
         for i in sorted(active):
@@ -981,7 +992,7 @@ def supervise_exit_slots_once() -> None:
             country = per_slot_country(i) or global_country
             isp = per_slot_isp(i) or global_isp
             used = set(current_slot_node_ids()) | {n.get("id") for _, n in bringup_jobs if n.get("id")}
-            candidate = _select_with_fallback(used, country, slot_residential_only, isp)
+            candidate = pick_slot_node(i, used, country=country, residential_only=slot_residential_only, isp=isp)
             if candidate:
                 bringup_jobs.append((i, candidate))
             else:

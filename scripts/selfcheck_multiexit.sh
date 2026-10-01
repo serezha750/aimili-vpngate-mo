@@ -69,7 +69,8 @@ for row in "${ROWS[@]}"; do
   # ① tun 设备
   if ip link show "$dev" >/dev/null 2>&1; then ok "tun 设备 ${dev} 存在"; else bad "tun 设备 ${dev} 不存在"; slot_ok=0; fi
   # ② 路由表 + 规则
-  table=$((200 + slot))
+  # 与 config.SLOT_TABLE_BASE(默认 102) 对齐：table = 102 + slot
+  table=$((102 + slot))
   if ip route show table "$table" 2>/dev/null | grep -q .; then ok "路由表 ${table} 已配置"; else bad "路由表 ${table} 为空"; slot_ok=0; fi
   if ip rule 2>/dev/null | grep -q "$dev"; then ok "ip rule (oif ${dev}) 已就绪"; else warn "未发现 oif ${dev} 的 ip rule"; fi
   # ③ 端口监听

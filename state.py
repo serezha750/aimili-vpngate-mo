@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 import threading
 from pathlib import Path
@@ -83,6 +84,23 @@ def get_state() -> dict[str, Any]:
     return state
 
 def set_state(**updates: Any) -> None:
-    state = get_state()
-    state.update(updates)
-    write_json(config.STATE_FILE, state)
+    """更新持久化状态。关键字段相对磁盘无变化时跳过写盘，降低 pinger/checker 的 IO。"""
+    if not updates:
+        return
+    with lock:
+        try:
+            current = json.loads(config.STATE_FILE.read_text(encoding="utf-8"))
+            if not isinstance(current, dict):
+                current = {}
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        changed = False
+        for k, v in updates.items():
+            if current.get(k) != v:
+                current[k] = v
+                changed = True
+        if not changed:
+            return
+        tmp = config.STATE_FILE.with_suffix(config.STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(config.STATE_FILE)

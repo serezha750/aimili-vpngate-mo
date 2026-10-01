@@ -9,6 +9,7 @@ import socket
 import threading
 import urllib.parse
 import time
+from collections import OrderedDict
 from typing import Any
 
 def parse_positive_int(value: str | None, default: int) -> int:
@@ -218,7 +219,7 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float, 
 
 DNS_CACHE_TTL = parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_TTL"), 300)
 DNS_CACHE_MAX = parse_positive_int(os.environ.get("LOCAL_PROXY_DNS_CACHE_MAX"), 4096)
-_dns_cache: dict[str, tuple[str, float]] = {}
+_dns_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
 _dns_cache_lock = threading.Lock()
 
 def get_tun_dns_servers() -> list[str]:
@@ -243,9 +244,13 @@ def resolve_dns_over_tun0(host: str, dns_server: str | None = None, timeout: flo
     with _dns_cache_lock:
         cached = _dns_cache.get(cache_key)
         if cached and now - cached[1] < DNS_CACHE_TTL:
+            _dns_cache.move_to_end(cache_key)  # LRU 命中
             return cached[0]
+        if cached:
+            # 过期条目清理
+            _dns_cache.pop(cache_key, None)
 
-    # 依次向多个上游 DNS 竞速查询，任一返回即用，避免单一 DNS 在隧道内不可达时干等超时
+    # 依次向多个上游 DNS 查询，任一返回即用，避免单一 DNS 在隧道内不可达时干等超时
     servers = [dns_server] if dns_server else get_tun_dns_servers()
     resolved = None
     for server in servers:
@@ -255,9 +260,10 @@ def resolve_dns_over_tun0(host: str, dns_server: str | None = None, timeout: flo
 
     if resolved:
         with _dns_cache_lock:
-            if len(_dns_cache) >= DNS_CACHE_MAX:
-                _dns_cache.clear()
             _dns_cache[cache_key] = (resolved, now)
+            _dns_cache.move_to_end(cache_key)
+            while len(_dns_cache) > DNS_CACHE_MAX:
+                _dns_cache.popitem(last=False)  # 淘汰最旧
     return resolved
 
 def purge_dns_cache(device: str | None = None) -> int:

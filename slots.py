@@ -32,6 +32,7 @@ slot_bad_nodes: dict[str, float] = {}
 slot_egress_fail_counts: dict[int, int] = {}
 last_exit_slots_heartbeat = 0.0
 last_slot_egress_heartbeat = 0.0
+exit_slots_wake = threading.Event()  # 有槽位变化时唤醒供给循环，避免干等
 
 # ---------- 历史管理（内存缓存 + 延迟刷盘，避免频繁磁盘 IO） ----------
 _slot_history_cache: dict[str, list[str]] | None = None
@@ -352,7 +353,7 @@ def add_one_slot() -> dict[str, Any]:
         active = sorted(active + [free])
         cfg = config.load_ui_config()
         _save_slot_lists(cfg, active=active)
-    threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+    trigger_supervise_exit_slots()
     return {"ok": True, "slot": free, "port": slot_port(free), "message": f"已新增槽位 #{free}（端口 {slot_port(free)}）"}
 
 def delete_slot(i: int) -> dict[str, Any]:
@@ -391,7 +392,7 @@ def start_slot(i: int) -> dict[str, Any]:
         cfg = config.load_ui_config()
         paused = get_paused_slots(); paused.discard(i)
         _save_slot_lists(cfg, paused=paused)
-    threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+    trigger_supervise_exit_slots()
     return {"ok": True, "slot": i, "message": f"已启动槽位 #{i}"}
 
 def get_slot_country_map() -> dict[str, str]:
@@ -861,6 +862,12 @@ def _select_with_fallback(used_ids: set[str], country: str, residential_only: bo
 
     return None
 
+
+def trigger_supervise_exit_slots() -> None:
+    """立即异步调度一次槽位供给，并唤醒主循环。"""
+    exit_slots_wake.set()
+    threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+
 def supervise_exit_slots_once() -> None:
     if not exit_slots_supervise_lock.acquire(blocking=False):
         return
@@ -1092,7 +1099,7 @@ def slot_egress_checker_loop() -> None:
                 print(f"[多出口] 槽位 {i} 节点 {nid} 出口不通，强制拆除并切换", flush=True)
                 utils.log_to_json("WARNING", "MultiExit", f"槽位 {i} 节点 {nid} 出口不通，强制漂移")
                 tear_down_slot(i, stop_proxy=True)
-                threading.Thread(target=supervise_exit_slots_once, daemon=True).start()
+                trigger_supervise_exit_slots()
         except Exception as e:
             print(f"[多出口] 出口健康检测异常: {e}", flush=True)
         time.sleep(config.SLOT_EGRESS_CHECK_INTERVAL)
@@ -1104,7 +1111,9 @@ def exit_slots_loop() -> None:
         available = [n for n in nodes if n.get("probe_status") == "available"]
         if not available:
             print("[多出口] 等待节点池就绪（尚无可用节点），30秒后重试...", flush=True)
-            time.sleep(30)
+            # 等待期间也可被唤醒（例如节点池刚就绪）
+            exit_slots_wake.wait(timeout=30)
+            exit_slots_wake.clear()
             continue
         last_exit_slots_heartbeat = time.time()
         try:
@@ -1112,4 +1121,6 @@ def exit_slots_loop() -> None:
         except Exception as e:
             print(f"[多出口] 供给器循环异常: {e}", flush=True)
             utils.log_to_json("ERROR", "MultiExit", f"供给器循环异常: {e}")
-        time.sleep(config.EXIT_SLOTS_CHECK_INTERVAL)
+        # 可被 trigger_supervise_exit_slots 提前唤醒，不必干等满整个间隔
+        exit_slots_wake.wait(timeout=config.EXIT_SLOTS_CHECK_INTERVAL)
+        exit_slots_wake.clear()

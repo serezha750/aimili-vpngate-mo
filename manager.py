@@ -1067,6 +1067,8 @@ def check_proxy_health() -> dict[str, Any]:
 def background_proxy_checker() -> None:
     global last_checker_heartbeat, is_connecting, main_egress_fail_count
     time.sleep(30)
+    last_proxy_ok: bool | None = None
+    last_proxy_ip = ""
     while True:
         state.last_checker_heartbeat = time.time()
         try:
@@ -1083,8 +1085,14 @@ def background_proxy_checker() -> None:
                     proxy_error=""
                 )
                 state.main_egress_fail_count = 0
-                utils.log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
+                # 仅在状态变化时写 INFO，避免每 30s 刷盘
+                if last_proxy_ok is not True or last_proxy_ip != res["ip"]:
+                    utils.log_to_json("INFO", "Proxy", f"代理可用，IP: {res['ip']}, 延迟: {res['latency_ms']} ms")
+                last_proxy_ok = True
+                last_proxy_ip = res["ip"]
             else:
+                last_proxy_ok = False
+                last_proxy_ip = ""
                 error_msg = res.get("error", "未知错误")
                 if state.active_openvpn_node_id:
                     print(f"[警告] {config.LOCAL_PROXY_PORT} 端口本地代理当前不可用！原因: {error_msg}", flush=True)

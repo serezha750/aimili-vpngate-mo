@@ -524,7 +524,14 @@ def select_slot_nodes(used_ids: set[str], need: int, country: str, residential_o
             if not any(kw in hay for kw in isp_kws):
                 continue
         pool.append(n)
-    pool.sort(key=lambda n: (utils.parse_int(n.get("latency_ms")) or 999999, -utils.parse_int(n.get("score"))))
+    def _rank(n: dict[str, Any]) -> tuple:
+        # 住宅/移动优先，再按延迟、分数
+        ip_t = n.get("ip_type") or ""
+        res_rank = 0 if ip_t in ("residential", "mobile") else 1
+        lat = utils.parse_int(n.get("latency_ms")) or 999999
+        score = -utils.parse_int(n.get("score"))
+        return (res_rank, lat, score)
+    pool.sort(key=_rank)
     return pool[:need]
 
 # ---------- 代理启动与拆除 ----------
@@ -584,40 +591,86 @@ def release_tun_device(dev: str) -> None:
         pass
 
 # ---------- 启动时出口验证（带重试，类似 manager.py 的 check_proxy_health） ----------
-def wait_for_proxy_ready(port: int, max_attempts: int = 3, timeout_per_attempt: float = 5.0) -> tuple[bool, str]:
-    """循环尝试多个端点，直到成功或超过最大尝试次数。返回 (ok, ip)"""
-    endpoints = [
-        "http://ip.sb",
-        "http://api.ipify.org",
-        "https://icanhazip.com",
-        "http://ifconfig.me",
-    ]
-    for attempt in range(max_attempts):
-        for url in endpoints:
-            try:
-                res = subprocess.run(
-                    ["curl", "-s", "-x", f"socks5h://127.0.0.1:{port}", url,
-                     "--max-time", str(timeout_per_attempt), "-w", "%{http_code}"],
-                    capture_output=True, text=True, timeout=timeout_per_attempt + 1,
-                )
-                if res.returncode != 0:
+_EGRESS_ENDPOINTS = (
+    "http://api.ipify.org",
+    "http://ip.sb",
+    "http://ifconfig.me/ip",
+    "http://icanhazip.com",
+)
+
+
+def _parse_public_ip(body: str) -> str | None:
+    body = (body or "").strip()
+    if not body or len(body) > 64:
+        return None
+    # 取第一行，避免部分站点尾部带多余文本
+    body = body.splitlines()[0].strip()
+    try:
+        ip = ipaddress.ip_address(body)
+    except ValueError:
+        return None
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        return None
+    return str(ip)
+
+
+def _curl_one_egress(port: int, url: str, timeout: float) -> str | None:
+    try:
+        res = subprocess.run(
+            [
+                "curl", "-s", "-L", "--max-redirs", "2",
+                "-x", f"socks5h://127.0.0.1:{port}",
+                url,
+                "--max-time", str(timeout),
+                "-w", "\n%{http_code}",
+            ],
+            capture_output=True, text=True, timeout=timeout + 1.5,
+        )
+        if res.returncode != 0:
+            return None
+        lines = res.stdout.strip().splitlines()
+        if len(lines) < 2:
+            return None
+        http_code = lines[-1].strip()
+        body = "\n".join(lines[:-1]).strip()
+        if http_code != "200":
+            return None
+        return _parse_public_ip(body)
+    except Exception:
+        return None
+
+
+def probe_slot_egress(port: int, timeout: float | None = None) -> tuple[bool, str]:
+    """经槽位 SOCKS5 并行探测公网出口 IP；任一端点成功即返回。"""
+    t = float(timeout if timeout is not None else config.SLOT_EGRESS_CURL_TIMEOUT)
+    endpoints = _EGRESS_ENDPOINTS
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints))
+    try:
+        futs = {pool.submit(_curl_one_egress, port, url, t): url for url in endpoints}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=t + 2):
+                try:
+                    ip = fut.result()
+                except Exception:
                     continue
-                stdout = res.stdout.strip()
-                if len(stdout) < 3:
-                    continue
-                http_code = stdout[-3:]
-                body = stdout[:-3].strip()
-                if http_code == "200" and body:
-                    try:
-                        ip = ipaddress.ip_address(body)
-                        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified):
-                            return True, str(ip)
-                    except ValueError:
-                        continue
-            except Exception:
-                continue
+                if ip:
+                    return True, ip
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return False, ""
+
+
+def wait_for_proxy_ready(port: int, max_attempts: int = 2, timeout_per_attempt: float | None = None) -> tuple[bool, str]:
+    """启动后出口验证：并行多端点，失败可短暂重试。"""
+    t = float(timeout_per_attempt if timeout_per_attempt is not None else config.SLOT_EGRESS_CURL_TIMEOUT)
+    for attempt in range(max(1, max_attempts)):
+        ok, ip = probe_slot_egress(port, timeout=t)
+        if ok:
+            return True, ip
         if attempt + 1 < max_attempts:
-            time.sleep(0.5)  # 重试间隔
+            time.sleep(0.4)
     return False, ""
 
 # ---------- 核心：bring_up_slot（含释放设备与重试） ----------
@@ -668,25 +721,25 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
     openvpn.setup_policy_routing(dev, slot_table(i))
     ensure_slot_proxy(i)
 
-    # 等待代理端口 TCP 就绪（快速检查）
+    # 等待代理端口 TCP 就绪（快速检查，最多约 3s）
     tcp_ready = False
-    for _ in range(10):
+    for _ in range(8):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1.0)
+            sock.settimeout(0.4)
             sock.connect(("127.0.0.1", slot_port(i)))
             sock.close()
             tcp_ready = True
             break
         except Exception:
-            time.sleep(0.5)
+            time.sleep(0.35)
     if not tcp_ready:
-        print(f"[多出口] 槽位 {i} 代理端口 {slot_port(i)} 无法在 5 秒内就绪，视为失败", flush=True)
+        print(f"[多出口] 槽位 {i} 代理端口 {slot_port(i)} 无法在约 3 秒内就绪，视为失败", flush=True)
         tear_down_slot(i, stop_proxy=True)
         return False
 
-    # 执行出口验证，重试 2 次
-    egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=2, timeout_per_attempt=5.0)
+    # 并行多端点出口验证（失败再短重试一次）
+    egress_ok, egress_ip = wait_for_proxy_ready(slot_port(i), max_attempts=2)
     if not egress_ok:
         print(f"[多出口] 槽位 {i} 出口验证失败（多次尝试后仍不可用），节点 {node.get('id')} 不可用，拆除槽位", flush=True)
         node_id = node.get('id')
@@ -894,9 +947,10 @@ def supervise_exit_slots_once() -> None:
         global_country = get_exit_slot_config().get('country', '')
         global_isp = get_exit_slot_config().get('isp', '')
 
+        need_bringup: list[int] = []
         for i in sorted(active):
             if i in paused:
-                if (i in exit_slot_proxy_stops) or (i in exit_slots and exit_slots[i].get('process') is not None):
+                if (i in exit_slot_proxy_stops) or (i in exit_slots and exit_slots[i].get("process") is not None):
                     tear_down_slot(i, stop_proxy=True)
                 mark_slot_paused(i)
                 continue
@@ -911,26 +965,43 @@ def supervise_exit_slots_once() -> None:
                         print(f"[多出口] 槽位 {i} 的节点 {current_node_id} 已失效，强制拆除并重新分配", flush=True)
                         reset_slot_history(i)
                         tear_down_slot(i, stop_proxy=True)
+                        need_bringup.append(i)
                     else:
                         continue
                 else:
                     tear_down_slot(i, stop_proxy=True)
+                    need_bringup.append(i)
             else:
                 tear_down_slot(i, stop_proxy=False)
+                need_bringup.append(i)
 
-            # 此时槽位已拆除，重新选择节点
+        # 先串行选节点（保证各槽位节点不重复），再并行 bring_up 加速多出口就绪
+        bringup_jobs: list[tuple[int, dict[str, Any]]] = []
+        for i in need_bringup:
             country = per_slot_country(i) or global_country
             isp = per_slot_isp(i) or global_isp
-            used = set(current_slot_node_ids())
-
+            used = set(current_slot_node_ids()) | {n.get("id") for _, n in bringup_jobs if n.get("id")}
             candidate = _select_with_fallback(used, country, slot_residential_only, isp)
             if candidate:
-                if bring_up_slot(i, candidate):
-                    continue
-                else:
-                    mark_slot_pending(i, f"启动节点 {candidate['id']} 失败")
+                bringup_jobs.append((i, candidate))
             else:
-                mark_slot_pending(i, f"无任何可用节点（过滤条件过于严格或节点池为空）")
+                mark_slot_pending(i, "无任何可用节点（过滤条件过于严格或节点池为空）")
+
+        if bringup_jobs:
+            workers = min(config.SLOT_BRINGUP_CONCURRENCY, len(bringup_jobs))
+            print(f"[多出口] 并行启动 {len(bringup_jobs)} 个槽位（并发 {workers}）", flush=True)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(_bring_up_wrapper, i, node): i for i, node in bringup_jobs}
+                for fut in concurrent.futures.as_completed(futs):
+                    i = futs[fut]
+                    node = next(n for idx, n in bringup_jobs if idx == i)
+                    try:
+                        ok = fut.result()
+                    except Exception as e:
+                        print(f"[多出口] 槽位 {i} 并行启动异常: {e}", flush=True)
+                        ok = False
+                    if not ok:
+                        mark_slot_pending(i, f"启动节点 {node.get('id')} 失败")
 
         write_slots_state()
     finally:
@@ -1038,33 +1109,15 @@ def rotate_exit_slots(count: int, country: str = "", isp: str = "", residential_
 
 # ========== 出口持续健康检测 ==========
 def check_slot_egress(port: int) -> tuple[bool, str]:
-    endpoints = ["https://icanhazip.com", "http://ip.sb", "http://api.ipify.org", "http://ifconfig.me", "https://cip.cc"]
-    for url in endpoints:
-        try:
-            res = subprocess.run(
-                ["curl", "-s", "-x", f"socks5h://127.0.0.1:{port}", url,
-                 "--max-time", "6", "-w", "%{http_code}"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if res.returncode != 0:
-                continue
-            stdout = res.stdout.strip()
-            if len(stdout) < 3:
-                continue
-            http_code = stdout[-3:]
-            body = stdout[:-3].strip()
-            if http_code != "200" or not body:
-                continue
-            try:
-                ip = ipaddress.ip_address(body)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
-                    continue
-                return True, str(ip)
-            except ValueError:
-                continue
-        except Exception:
-            continue
-    return False, ""
+    """周期健康检查用：并行多端点探测槽位出口。"""
+    return probe_slot_egress(port)
+
+def _prune_slot_bad_nodes() -> None:
+    now = time.time()
+    expired = [nid for nid, until in slot_bad_nodes.items() if until <= now]
+    for nid in expired:
+        slot_bad_nodes.pop(nid, None)
+
 
 def slot_egress_checker_loop() -> None:
     global last_slot_egress_heartbeat
@@ -1072,14 +1125,33 @@ def slot_egress_checker_loop() -> None:
     while True:
         last_slot_egress_heartbeat = time.time()
         try:
+            _prune_slot_bad_nodes()
             active = set(get_active_slots())
             paused = get_paused_slots()
+            targets: list[int] = []
             for i in sorted(active):
                 if i in paused:
                     continue
                 if not slot_process_alive(i):
                     continue
-                ok, ip = check_slot_egress(slot_port(i))
+                targets.append(i)
+
+            # 并行检测各槽位出口，缩短多出口场景下的一轮耗时
+            results: dict[int, tuple[bool, str]] = {}
+            if targets:
+                workers = min(config.SLOT_EGRESS_PARALLEL, len(targets))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {pool.submit(check_slot_egress, slot_port(i)): i for i in targets}
+                    for fut in concurrent.futures.as_completed(futs):
+                        i = futs[fut]
+                        try:
+                            results[i] = fut.result()
+                        except Exception:
+                            results[i] = (False, "")
+
+            need_reschedule = False
+            for i in targets:
+                ok, ip = results.get(i, (False, ""))
                 with exit_slots_lock:
                     s = exit_slots.get(i)
                     if s is not None:
@@ -1099,6 +1171,8 @@ def slot_egress_checker_loop() -> None:
                 print(f"[多出口] 槽位 {i} 节点 {nid} 出口不通，强制拆除并切换", flush=True)
                 utils.log_to_json("WARNING", "MultiExit", f"槽位 {i} 节点 {nid} 出口不通，强制漂移")
                 tear_down_slot(i, stop_proxy=True)
+                need_reschedule = True
+            if need_reschedule:
                 trigger_supervise_exit_slots()
         except Exception as e:
             print(f"[多出口] 出口健康检测异常: {e}", flush=True)

@@ -33,53 +33,185 @@ slot_egress_fail_counts: dict[int, int] = {}
 last_exit_slots_heartbeat = 0.0
 last_slot_egress_heartbeat = 0.0
 
-# ---------- 历史管理 ----------
-def load_slot_history() -> dict[str, list[str]]:
+# ---------- 历史管理（内存缓存 + 延迟刷盘，避免频繁磁盘 IO） ----------
+_slot_history_cache: dict[str, list[str]] | None = None
+_slot_history_dirty: bool = False
+_slot_history_lock = threading.RLock()
+_SLOT_HISTORY_FLUSH_INTERVAL = 5.0  # 秒：脏数据最长滞留时间
+_last_history_flush = 0.0
+
+
+def _read_history_from_disk() -> dict[str, list[str]]:
     if not config.SLOT_HISTORY_FILE.exists():
         return {}
     try:
-        with open(config.SLOT_HISTORY_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+        with open(config.SLOT_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            # 规范化 value 为 list[str]
+            out: dict[str, list[str]] = {}
+            for k, v in data.items():
+                if isinstance(v, list):
+                    out[str(k)] = [str(x) for x in v]
+                elif v is not None:
+                    out[str(k)] = [str(v)]
+            return out
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        print(f"[多出口] 读取 slot_history 失败，使用空历史: {e}", flush=True)
+    return {}
+
+
+def _write_history_to_disk(history: dict[str, list[str]]) -> None:
+    try:
+        config.SLOT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = config.SLOT_HISTORY_FILE.with_suffix(config.SLOT_HISTORY_FILE.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+        tmp.replace(config.SLOT_HISTORY_FILE)
+    except OSError as e:
+        print(f"[多出口] 写入 slot_history 失败: {e}", flush=True)
+
+
+def load_slot_history() -> dict[str, list[str]]:
+    """返回内存中的历史副本（只读场景可直接用，写场景请走 record/reset）。"""
+    global _slot_history_cache
+    with _slot_history_lock:
+        if _slot_history_cache is None:
+            _slot_history_cache = _read_history_from_disk()
+        # 返回浅拷贝，避免外部直接改缓存
+        return {k: list(v) for k, v in _slot_history_cache.items()}
+
+
+def flush_slot_history(force: bool = False) -> None:
+    """将脏缓存刷到磁盘。force=True 时无条件写入。"""
+    global _slot_history_dirty, _last_history_flush
+    with _slot_history_lock:
+        if _slot_history_cache is None:
+            return
+        if not force and not _slot_history_dirty:
+            return
+        _write_history_to_disk(_slot_history_cache)
+        _slot_history_dirty = False
+        _last_history_flush = time.time()
+
+
+def _maybe_flush_history() -> None:
+    """脏数据超过间隔则刷盘。"""
+    global _last_history_flush
+    with _slot_history_lock:
+        if not _slot_history_dirty:
+            return
+        if time.time() - _last_history_flush < _SLOT_HISTORY_FLUSH_INTERVAL:
+            return
+    flush_slot_history(force=True)
+
 
 def save_slot_history(history: dict[str, list[str]]) -> None:
-    with open(config.SLOT_HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=2)
+    """兼容旧接口：更新缓存并标记脏，再尝试按间隔刷盘。"""
+    global _slot_history_cache, _slot_history_dirty
+    with _slot_history_lock:
+        _slot_history_cache = {str(k): list(v) if isinstance(v, list) else [str(v)] for k, v in history.items()}
+        _slot_history_dirty = True
+    _maybe_flush_history()
+
 
 def get_used_nodes(history: dict[str, list[str]]) -> set[str]:
-    used = set()
+    used: set[str] = set()
     for ids in history.values():
         used.update(ids)
     return used
 
-def record_node_used(slot: int, node_id: str) -> None:
-    history = load_slot_history()
-    key = str(slot)
-    if key not in history:
-        history[key] = []
-    if node_id not in history[key]:
-        history[key].append(node_id)
-    save_slot_history(history)
 
-def reset_slot_history(slot: int = None) -> None:
-    if slot is None:
-        if config.SLOT_HISTORY_FILE.exists():
-            config.SLOT_HISTORY_FILE.unlink()
+def record_node_used(slot: int, node_id: str) -> None:
+    if not node_id:
+        return
+    global _slot_history_cache, _slot_history_dirty
+    with _slot_history_lock:
+        if _slot_history_cache is None:
+            _slot_history_cache = _read_history_from_disk()
+        key = str(slot)
+        lst = _slot_history_cache.setdefault(key, [])
+        if node_id not in lst:
+            lst.append(node_id)
+            _slot_history_dirty = True
+    _maybe_flush_history()
+
+
+def reset_slot_history(slot: int | None = None) -> None:
+    global _slot_history_cache, _slot_history_dirty
+    with _slot_history_lock:
+        if _slot_history_cache is None:
+            _slot_history_cache = _read_history_from_disk()
+        if slot is None:
+            _slot_history_cache = {}
+            _slot_history_dirty = True
+            # 立即落盘并尽量删除文件，保持语义一致
+            try:
+                if config.SLOT_HISTORY_FILE.exists():
+                    config.SLOT_HISTORY_FILE.unlink()
+                _slot_history_dirty = False
+            except OSError:
+                # 删除失败则保留脏标记，稍后重试写入空对象
+                pass
+        else:
+            if str(slot) in _slot_history_cache:
+                _slot_history_cache.pop(str(slot), None)
+                _slot_history_dirty = True
+    if slot is not None:
+        _maybe_flush_history()
     else:
-        history = load_slot_history()
-        history.pop(str(slot), None)
-        save_slot_history(history)
+        flush_slot_history(force=True)
 
 # ---------- 辅助函数 ----------
-def kill_slot_openvpn_processes() -> None:
+def _kill_pids(pids: list[int], label: str = "") -> list[int]:
+    """先 SIGTERM 再 SIGKILL，返回实际发出信号的 pid 列表。"""
+    killed: list[int] = []
+    for pid in pids:
+        if pid <= 0 or pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if killed:
+        time.sleep(0.3)
+        for pid in killed:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if label:
+            print(f"[多出口] {label}: {killed}", flush=True)
+    return killed
+
+
+def _find_slot_openvpn_pids() -> list[int]:
+    """查找带 SLOT_PROCESS_MARKER 的 openvpn 进程。优先 pgrep，回退 /proc 扫描。"""
     if not sys.platform.startswith("linux"):
-        return
+        return []
+    # 1) pgrep 更快
     try:
-        proc_root = Path("/proc")
-        if not proc_root.exists():
-            return
-        killed: list[int] = []
+        res = subprocess.run(
+            ["pgrep", "-f", f"openvpn.*{config.SLOT_PROCESS_MARKER}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            pids: list[int] = []
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pids.append(int(line))
+            return pids
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # 2) 回退扫描 /proc
+    pids = []
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    try:
         for proc_dir in proc_root.iterdir():
             if not proc_dir.name.isdigit():
                 continue
@@ -95,19 +227,38 @@ def kill_slot_openvpn_processes() -> None:
             cmdline = " ".join(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
             if "openvpn" not in cmdline.lower() or config.SLOT_PROCESS_MARKER not in cmdline:
                 continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-                killed.append(pid)
-            except (ProcessLookupError, PermissionError):
-                pass
-        if killed:
-            time.sleep(0.5)
-            for pid in killed:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            print(f"[多出口] 启动清理遗留槽位隧道进程: {killed}", flush=True)
+            pids.append(pid)
+    except OSError:
+        pass
+    return pids
+
+
+def kill_slot_openvpn_processes() -> None:
+    """启动时清理遗留槽位隧道进程与策略路由。优先用已记录的 process/pid，再扫残留。"""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        # 先停内存中仍持有的 process 对象
+        tracked: list[int] = []
+        with exit_slots_lock:
+            for s in list(exit_slots.values()):
+                p = s.get("process")
+                if p is not None and getattr(p, "poll", lambda: None)() is None:
+                    try:
+                        tracked.append(int(p.pid))
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                pid = s.get("pid")
+                if isinstance(pid, int) and pid > 0:
+                    tracked.append(pid)
+        if tracked:
+            _kill_pids(sorted(set(tracked)), "清理已跟踪槽位进程")
+
+        # 再扫系统中可能残留的 AIMILI_SLOT openvpn
+        orphans = _find_slot_openvpn_pids()
+        if orphans:
+            _kill_pids(orphans, "启动清理遗留槽位隧道进程")
+
         for i in range(config.MAX_EXIT_SLOTS):
             openvpn.cleanup_policy_routing(config.SLOT_TABLE_BASE + i)
     except Exception as e:
@@ -394,32 +545,40 @@ def ensure_slot_proxy(i: int) -> None:
 
 # ========== 新增：强制释放 tun 设备 ==========
 def release_tun_device(dev: str) -> None:
-    """强制释放指定的 tun 设备：杀掉占用进程并删除设备"""
+    """强制释放指定的 tun 设备：杀掉占用进程并删除设备。优先 pgrep，避免全量 ps。"""
+    pids: list[int] = []
     try:
-        # 查找占用该设备的 openvpn 进程
-        result = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if "openvpn" in line and f"--dev {dev}" in line:
-                parts = line.split()
-                if parts:
-                    pid = int(parts[0])
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                        time.sleep(0.2)
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except OSError:
-                            pass
-                    except OSError:
-                        pass
-    except Exception as e:
-        print(f"[release_tun_device] 查找进程失败: {e}")
+        res = subprocess.run(
+            ["pgrep", "-f", f"openvpn.*--dev {dev}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    pids.append(int(line))
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "pid,cmd"], capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if "openvpn" in line and f"--dev {dev}" in line:
+                    parts = line.split()
+                    if parts and parts[0].isdigit():
+                        pids.append(int(parts[0]))
+        except Exception as e:
+            print(f"[release_tun_device] 查找进程失败: {e}", flush=True)
 
-    # 尝试删除设备
+    if pids:
+        _kill_pids(pids, f"释放设备 {dev} 占用进程")
+
     try:
-        subprocess.run(["ip", "tuntap", "del", dev, "mode", "tun"],
-                       stderr=subprocess.DEVNULL, timeout=2)
-        print(f"[release_tun_device] 已删除设备 {dev}")
+        subprocess.run(
+            ["ip", "tuntap", "del", dev, "mode", "tun"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
+        print(f"[release_tun_device] 已删除设备 {dev}", flush=True)
     except Exception:
         pass
 
@@ -540,6 +699,12 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
         print(f"[多出口] 槽位 {i} 出口验证通过，出口 IP: {egress_ip}", flush=True)
 
     # 所有检查通过，记录状态
+    pid_val = None
+    try:
+        if process is not None:
+            pid_val = int(process.pid)
+    except (TypeError, ValueError, AttributeError):
+        pid_val = None
     with exit_slots_lock:
         exit_slots[i] = {
             "slot": i, "device": dev, "table": slot_table(i), "port": slot_port(i),
@@ -548,7 +713,8 @@ def bring_up_slot(i: int, node: dict[str, Any]) -> bool:
             "ip": node.get("ip") or node.get("remote_host"),
             "ip_type": node.get("ip_type"), "location": node.get("location"),
             "owner": node.get("owner"), "latency_ms": node.get("latency_ms"),
-            "process": process, "status": "up", "since": time.time(), "message": "",
+            "process": process, "pid": pid_val,
+            "status": "up", "since": time.time(), "message": "",
             "exit_ip": egress_ip,
             "egress_ok": True,
         }
@@ -579,27 +745,37 @@ def tear_down_slot(i: int, stop_proxy: bool = True) -> None:
     with exit_slots_lock:
         slot = exit_slots.pop(i, None)
         stop_ev = exit_slot_proxy_stops.pop(i, None) if stop_proxy else None
-    if slot and slot.get("process"):
-        openvpn.stop_process(slot["process"])
+    if slot:
+        proc = slot.get("process")
+        if proc is not None:
+            openvpn.stop_process(proc)
+        else:
+            pid = slot.get("pid")
+            if isinstance(pid, int) and pid > 0:
+                _kill_pids([pid])
     openvpn.cleanup_policy_routing(slot_table(i))
     try:
         p = slot_config_path(i)
         if p.exists():
             p.unlink()
-    except Exception:
+    except OSError:
         pass
     if stop_proxy and stop_ev is not None:
         stop_ev.set()
         time.sleep(0.2)
         print(f"[多出口] 槽位 {i} 已拆除（含代理端口 {slot_port(i)}）", flush=True)
 
-    # ----- 新增：删除 tun 设备 -----
+    # 删除 tun 设备（若仍存在）
     dev = slot_device(i)
     try:
-        subprocess.run(["ip", "tuntap", "del", dev, "mode", "tun"],
-                       stderr=subprocess.DEVNULL, timeout=2)
+        subprocess.run(
+            ["ip", "tuntap", "del", dev, "mode", "tun"],
+            stderr=subprocess.DEVNULL, timeout=2,
+        )
     except Exception:
         pass
+    # 历史可能刚被 reset/record，顺手刷一次（廉价 no-op 若未脏）
+    flush_slot_history()
 
 def slot_process_alive(i: int) -> bool:
     with exit_slots_lock:

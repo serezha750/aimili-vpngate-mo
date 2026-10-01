@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+import concurrent.futures
 import os
 import secrets
 import select
@@ -585,43 +586,59 @@ def start_proxy_server(host: str, port: int, device: str = "tun0", stop_event: t
     if stop_event is not None:
         server.settimeout(1.0)
 
-    while True:
-        if stop_event is not None and stop_event.is_set():
-            try:
-                server.close()
-            except OSError:
-                pass
-            print(f"[代理网关] 已停止监听 {host}:{port} ({device})", flush=True)
-            return
-        try:
-            client, address = server.accept()
-            if not proxy_connection_sem.acquire(blocking=False):
-                print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
-                try:
-                    client.close()
-                except OSError:
-                    pass
-                continue
-
-            def run_client() -> None:
-                try:
-                    if registry is not None:
-                        registry.add(client)
-                    proxy_client(client, address, device)
-                finally:
-                    if registry is not None:
-                        registry.discard(client)
-                    proxy_connection_sem.release()
-
-            threading.Thread(target=run_client, daemon=True).start()
-        except socket.timeout:
-            continue
-        except Exception as e:
+    # 线程池限制并发处理线程数，避免每连接无限创建裸 Thread
+    pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=MAX_PROXY_CONNECTIONS,
+        thread_name_prefix=f"proxy-{port}",
+    )
+    try:
+        while True:
             if stop_event is not None and stop_event.is_set():
                 try:
                     server.close()
                 except OSError:
                     pass
+                print(f"[代理网关] 已停止监听 {host}:{port} ({device})", flush=True)
                 return
-            print(f"[ERROR] Proxy accept failed: {e}", flush=True)
-            time.sleep(0.5)
+            try:
+                client, address = server.accept()
+                if not proxy_connection_sem.acquire(blocking=False):
+                    print(f"[代理限流] 当前连接数已达到上限 {MAX_PROXY_CONNECTIONS}，拒绝客户端 {address}", flush=True)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                    continue
+
+                def run_client(cli: socket.socket = client, addr: Any = address) -> None:
+                    try:
+                        if registry is not None:
+                            registry.add(cli)
+                        proxy_client(cli, addr, device)
+                    finally:
+                        if registry is not None:
+                            registry.discard(cli)
+                        proxy_connection_sem.release()
+
+                try:
+                    pool.submit(run_client)
+                except RuntimeError:
+                    # 池已关闭
+                    proxy_connection_sem.release()
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if stop_event is not None and stop_event.is_set():
+                    try:
+                        server.close()
+                    except OSError:
+                        pass
+                    return
+                print(f"[ERROR] Proxy accept failed: {e}", flush=True)
+                time.sleep(0.5)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)

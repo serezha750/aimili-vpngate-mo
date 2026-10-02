@@ -1027,8 +1027,9 @@
           <input type="number" id="slot_count" class="input-field" min="0" max="100" value="0">
         </div>
         <div class="form-group">
-          <label class="form-label" for="slot_country">国家过滤 (留空=不限)</label>
-          <input type="text" id="slot_country" class="input-field" placeholder="如 JP 或 JP,KR">
+          <label class="form-label" for="slot_country">国家过滤（可选可用节点所在国家，多选）</label>
+          <select id="slot_country" class="input-field" multiple size="5" style="min-height: 110px; background: rgba(255,255,255,0.03);" title="按住 Ctrl/Cmd 可多选；不选=不限国家"></select>
+          <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">列表来自当前<strong>可用节点</strong>；不选择任何项表示不限国家</div>
         </div>
       </div>
       <div class="form-group" style="margin-bottom: 14px;">
@@ -1036,7 +1037,7 @@
         <input type="text" id="slot_isp" class="input-field" placeholder="如 NTT,So-net,KDDI（逗号分隔，匹配运营主体）">
       </div>
       <div class="form-group" style="margin-bottom: 14px; display: flex; align-items: center; gap: 8px;">
-        <input type="checkbox" id="slot_residential" checked style="width: 16px; height: 16px; cursor: pointer;">
+        <input type="checkbox" id="slot_residential" onchange="refreshSlotCountrySelect(null)" checked style="width: 16px; height: 16px; cursor: pointer;">
         <label for="slot_residential" style="font-size: 13px; color: var(--text-secondary); cursor: pointer; margin: 0;">仅使用住宅/移动 IP（推荐；关闭则允许机房 IP 补位）</label>
       </div>
       <div style="display: flex; gap: 12px; justify-content: flex-end; margin-bottom: 8px;">
@@ -1505,17 +1506,19 @@ function updateCountryFilter() {
   const countries = Array.from(new Set(nodes.map(n => n ? translateCountry(n.country) : "").filter(Boolean))).sort();
   
   const currentOptions = Array.from(select.options).map(o => o.value).filter(Boolean);
-  if (JSON.stringify(countries) === JSON.stringify(currentOptions)) {
-    return;
+  if (JSON.stringify(countries) !== JSON.stringify(currentOptions)) {
+    select.innerHTML = '<option value="">所有国家</option>' + 
+      countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+    
+    if (countries.includes(selectedValue)) {
+      select.value = selectedValue;
+    } else {
+      select.value = "";
+    }
   }
-  
-  select.innerHTML = '<option value="">所有国家</option>' + 
-    countries.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
-  
-  if (countries.includes(selectedValue)) {
-    select.value = selectedValue;
-  } else {
-    select.value = "";
+  // 同步刷新多出口「可用国家」下拉（节点池变化后）
+  if (typeof refreshSlotCountrySelect === "function") {
+    try { refreshSlotCountrySelect(null); } catch (e) {}
   }
 }
 
@@ -2632,6 +2635,83 @@ function openExitSlotsModal() {
   openExitSlotsPanel();
 }
 
+
+/** 从当前节点池汇总「可用」国家（code -> 显示名与数量） */
+function getAvailableCountryOptions(residentialOnly) {
+  const map = new Map();
+  const list = Array.isArray(nodes) ? nodes : [];
+  for (const n of list) {
+    if (!n || n.probe_status !== "available") continue;
+    if (residentialOnly && !["residential", "mobile"].includes(n.ip_type || "")) continue;
+    const code = String(n.country_short || "").toUpperCase().trim();
+    if (!code) continue;
+    const name = translateCountry(n.country) || n.country || code;
+    const cur = map.get(code) || { name: name, count: 0 };
+    cur.count += 1;
+    if (!cur.name) cur.name = name;
+    map.set(code, cur);
+  }
+  return Array.from(map.entries())
+    .map(([code, info]) => ({ code, name: info.name, count: info.count }))
+    .sort((a, b) => String(a.name).localeCompare(String(b.name), "zh"));
+}
+
+function buildCountrySelectHtml(selectedCodes, residentialOnly, includeEmpty, emptyLabel) {
+  const selected = new Set(
+    String(selectedCodes || "")
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+  );
+  const opts = getAvailableCountryOptions(!!residentialOnly);
+  let html = "";
+  if (includeEmpty) {
+    html += `<option value="">${emptyLabel || "跟随全局 / 不限"}</option>`;
+  }
+  for (const o of opts) {
+    const sel = selected.has(o.code) ? " selected" : "";
+    html += `<option value="${esc(o.code)}"${sel}>${esc(o.code)} · ${esc(o.name)}（${o.count} 可用）</option>`;
+  }
+  // 若已保存的国家当前节点池里没有，仍保留选项以免丢失配置
+  for (const code of selected) {
+    if (opts.some((o) => o.code === code)) continue;
+    html += `<option value="${esc(code)}" selected>${esc(code)} · （当前无可用节点）</option>`;
+  }
+  return html;
+}
+
+function getMultiSelectValues(el) {
+  if (!el) return "";
+  if (!el.multiple) return (el.value || "").trim();
+  return Array.from(el.selectedOptions || [])
+    .map((o) => (o.value || "").trim())
+    .filter(Boolean)
+    .join(",");
+}
+
+function refreshSlotCountrySelect(fillSelected) {
+  const sel = $("slot_country");
+  if (!sel || sel.tagName !== "SELECT") return;
+  const residential = $("slot_residential") ? $("slot_residential").checked : true;
+  let current = "";
+  if (fillSelected !== undefined && fillSelected !== null) {
+    current = String(fillSelected);
+  } else {
+    current = getMultiSelectValues(sel);
+  }
+  sel.innerHTML = buildCountrySelectHtml(current, residential, false, "");
+  // 重新选中
+  const want = new Set(
+    String(current)
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+  );
+  Array.from(sel.options).forEach((o) => {
+    o.selected = want.has((o.value || "").toUpperCase());
+  });
+}
+
 async function loadExitSlots(fillForm) {
   try {
     const res = await fetch("./api/exit_slots");
@@ -2639,9 +2719,12 @@ async function loadExitSlots(fillForm) {
     if (fillForm && data.config) {
       $("slot_count").value = data.config.count;
       $("slot_count").max = data.max_slots || 16;
-      $("slot_country").value = data.config.country || "";
       if ($("slot_isp")) $("slot_isp").value = data.config.isp || "";
       $("slot_residential").checked = data.config.residential_only !== false;
+      refreshSlotCountrySelect(data.config.country || "");
+    } else {
+      // 节点池可能已更新，刷新下拉选项但尽量保留当前勾选
+      refreshSlotCountrySelect(null);
     }
     renderExitSlots(data);
   } catch (e) {
@@ -2701,7 +2784,7 @@ function renderExitSlots(data) {
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-top:8px;">'
         + '<span style="font-size:11px;color:var(--text-secondary);flex-shrink:0;width:52px;">本槽地区</span>'
-        + '<input type="text" id="slot_cf_' + s.slot + '" value="' + cf + '" placeholder="' + ph + '" style="flex:1;min-width:0;height:28px;font-size:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);color:var(--text-primary);border-radius:6px;padding:0 8px;outline:none;">'
+        + '<select id="slot_cf_' + s.slot + '" style="flex:1;min-width:0;height:28px;font-size:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border-color);color:var(--text-primary);border-radius:6px;padding:0 6px;outline:none;">' + buildCountrySelectHtml(cf, $("slot_residential") ? $("slot_residential").checked : true, true, ph || "跟随全局") + '</select>'
         + '<button type="button" onclick="saveSlotCountry(' + s.slot + ',this)" style="flex-shrink:0;height:28px;padding:0 10px;font-size:12px;font-weight:600;border-radius:6px;border:1px solid var(--border-color);background:transparent;color:var(--text-secondary);cursor:pointer;">设定</button>'
       + '</div>'
       + '<div style="display:flex;align-items:center;gap:8px;margin-top:6px;">'
@@ -2819,7 +2902,7 @@ async function saveExitSlots(event) {
   try {
     const payload = {
       count: parseInt($("slot_count").value || "0", 10),
-      country: $("slot_country").value.trim(),
+      country: getMultiSelectValues($("slot_country")),
       isp: ($("slot_isp") ? $("slot_isp").value : "").trim(),
       residential_only: $("slot_residential").checked
     };

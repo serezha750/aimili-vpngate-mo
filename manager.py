@@ -758,6 +758,56 @@ def run_publicvpnlist_import_and_test() -> None:
 
     threading.Thread(target=_task, daemon=True).start()
 
+
+def ensure_main_connection_from_available(reason: str = "") -> bool:
+    """若主连接未运行，且节点池中已有 probe_status=available 的节点，立即连接。
+
+    不阻塞于全量测速：7928 应优先使用已可用节点。
+    返回是否已成功发起/处于连接流程（含已在运行）。
+    """
+    if active_openvpn_running():
+        return True
+    ui_cfg = config.load_ui_config()
+    if not ui_cfg.get("connection_enabled", True):
+        return False
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    if routing_mode == "fixed_ip":
+        target_id = state.active_openvpn_node_id or ui_cfg.get("fixed_node_id", "")
+        if not target_id:
+            return False
+        nodes = state.read_nodes()
+        if not any(n.get("id") == target_id for n in nodes):
+            return False
+        # 允许打断「仅测速」占用的 is_connecting
+        state.is_connecting = False
+        try:
+            print(f"[快速连接] 固定 IP 模式立即拉起节点 {target_id} ({reason})", flush=True)
+            connect_node(target_id)
+            return True
+        except Exception as e:
+            print(f"[快速连接] 固定节点拉起失败: {e}", flush=True)
+            return False
+
+    nodes = state.read_nodes()
+    available_count = sum(1 for n in nodes if n.get("probe_status") == "available")
+    if available_count <= 0:
+        return False
+
+    # 测速过程中 is_connecting 可能为 True，会挡住 connect_node；此处强制放开
+    state.is_connecting = False
+    try:
+        print(
+            f"[快速连接] 节点池已有 {available_count} 个可用节点，主连接未运行，立即建立 7928 出口 ({reason})",
+            flush=True,
+        )
+        utils.log_to_json("INFO", "VPN", f"快速连接: 使用已有可用节点建立主连接 ({reason})")
+        auto_switch_node()
+        return active_openvpn_running() or bool(state.active_openvpn_node_id)
+    except Exception as e:
+        print(f"[快速连接] 自动切换失败: {e}", flush=True)
+        return False
+
+
 def maintain_valid_nodes(force: bool = False) -> str:
     global active_openvpn_process, active_openvpn_node_id, is_connecting
     config.ensure_dirs()
@@ -765,7 +815,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         msg = "节点维护任务正在运行，请稍后再试"
         state.set_state(last_check_message=msg)
         return msg
-    state.is_connecting = True
+    # 注意：全量测速不再占用 is_connecting，避免挡住 7928 使用「已可用」节点
     try:
         if force:
             with state.lock:
@@ -776,17 +826,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
             connection_enabled = ui_cfg.get("connection_enabled", True)
             if connection_enabled:
                 if routing_mode == "fixed_ip":
-                    target_id = state.active_openvpn_node_id or ui_cfg.get("fixed_node_id", "")
-                    if target_id:
-                        nodes = state.read_nodes()
-                        if any(n.get("id") == target_id for n in nodes):
-                            print(f"[维护线程] 检测到固定 IP 模式下 OpenVPN 未运行，正在重新拉起同一节点: {target_id}", flush=True)
-                            state.is_connecting = False
-                            try:
-                                connect_node(target_id)
-                            except Exception as e:
-                                print(f"[维护线程] 重新拉起固定节点 {target_id} 失败: {e}", flush=True)
-                            state.is_connecting = True
+                    ensure_main_connection_from_available("维护-固定IP")
                 else:
                     has_active_id = False
                     with state.lock:
@@ -795,12 +835,13 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             stop_active_openvpn()
                     if has_active_id:
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
-                        state.is_connecting = False
-                        auto_switch_node()
-                        state.is_connecting = True
+                        ensure_main_connection_from_available("维护-进程退出")
+                    else:
+                        # 启动或空闲：池中已有可用节点则立刻连，不必等测速
+                        ensure_main_connection_from_available("维护开始-已有可用节点")
 
         try:
-            state.set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
+            state.set_state(last_check_message="正在拉取最新的免费 VPN 节点列表...")
             candidates = fetch.fetch_candidates()
         except Exception as exc:
             vpn_utils.check_and_fix_dns()
@@ -858,72 +899,64 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 to_test = [n for n in current_nodes if not n.get("active")]
                 to_test_ids = [n["id"] for n in to_test]
 
-            if candidates or to_test_ids:
-                msg = f"开始对列表中所有候选节点进行周期连通性与延迟测试，待检测节点共 {len(to_test_ids)} 个"
+            # 测速与主连接解耦：优先测「非 available」节点；已 available 的可延后抽检
+            priority_ids = [
+                n["id"] for n in current_nodes
+                if not n.get("active") and n.get("probe_status") != "available"
+            ]
+            already_ok = [
+                n["id"] for n in current_nodes
+                if not n.get("active") and n.get("probe_status") == "available"
+            ]
+            # 已可用节点每轮最多抽检一部分，避免长期占用且拖慢主连接
+            recheck_cap = max(10, min(30, len(already_ok) // 5 or 10))
+            recheck_ids = already_ok[:recheck_cap]
+            test_ids = priority_ids + recheck_ids
+
+            # 测速前再尝试一次快速连接（合并后可能已有历史 available）
+            if not active_openvpn_running():
+                ensure_main_connection_from_available("测速前")
+
+            if candidates or test_ids:
+                msg = (
+                    f"节点检测：优先待测 {len(priority_ids)} 个（非可用），"
+                    f"抽检已可用 {len(recheck_ids)}/{len(already_ok)} 个；"
+                    f"主连接不阻塞于全量测速"
+                )
                 print(f"[周期检测] {msg}", flush=True)
                 utils.log_to_json("INFO", "Main", msg)
 
-                state.set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
-                test_multiple_nodes(to_test_ids)
-                state.is_connecting = False
+                # 仅更新文案，不置 is_connecting，避免 UI「测试中」挡住连接与代理逻辑
+                state.set_state(last_check_message=f"后台检测节点中（优先非可用 {len(priority_ids)} 个）...")
+                test_multiple_nodes(test_ids)
 
                 with state.lock:
                     merged = state.read_nodes()
-
                     available_nodes = [n["id"] for n in merged if n.get("probe_status") == "available"]
                     unavailable_nodes = [n["id"] for n in merged if n.get("probe_status") == "unavailable"]
                     active_node = next((n["id"] for n in merged if n.get("active")), "无")
 
-                    status_report = (
-                        f"周期节点检测完成。实时同步状态: 获取到候选节点共 {len(merged)} 个。 "
-                        f"其中【可用节点】{len(available_nodes)} 个: {available_nodes[:15]}...; "
-                        f"【不可用节点】{len(unavailable_nodes)} 个; "
-                        f"当前【正在正常运行的活动连接节点】为: {active_node}。"
-                    )
-                    print(f"[周期检测] {status_report}", flush=True)
-                    utils.log_to_json("INFO", "Main", status_report)
+                status_report = (
+                    f"周期节点检测完成。实时同步状态: 获取到候选节点共 {len(merged)} 个。 "
+                    f"其中【可用节点】{len(available_nodes)} 个: {available_nodes[:15]}...; "
+                    f"【不可用节点】{len(unavailable_nodes)} 个; "
+                    f"当前【正在正常运行的活动连接节点】为: {active_node}。"
+                )
+                print(f"[周期检测] {status_report}", flush=True)
+                utils.log_to_json("INFO", "Main", status_report)
 
-                    if active_node != "无" and not active_openvpn_running():
-                        warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
-                        print(warn_msg, flush=True)
-                        utils.log_to_json("WARNING", "Main", warn_msg)
+                if active_node != "无" and not active_openvpn_running():
+                    warn_msg = f"[诊断警告] 活动节点 {active_node} 被标记为活动状态，但 OpenVPN 进程实际并未正常运行！"
+                    print(warn_msg, flush=True)
+                    utils.log_to_json("WARNING", "Main", warn_msg)
 
-                    if not active_openvpn_running():
-                        ui_cfg = config.load_ui_config()
-                        connection_enabled = ui_cfg.get("connection_enabled", True)
-                        if connection_enabled:
-                            routing_mode = ui_cfg.get("routing_mode", "auto")
-                            target_country = ui_cfg.get("force_country", "")
-
-                            if routing_mode != "fixed_ip":
-                                available_candidates = [n for n in merged if n.get("probe_status") == "available"]
-                                if routing_mode == "fixed_region" and target_country:
-                                    available_candidates = [
-                                        n for n in available_candidates
-                                        if n.get("country") == target_country
-                                        or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
-                                    ]
-                                elif routing_mode == "favorites":
-                                    fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-                                    fav_candidates = [n for n in available_candidates if n.get("id") in fav_ids]
-                                    if fav_candidates:
-                                        available_candidates = fav_candidates
-                                    else:
-                                        fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
-                                        if not fav_fail_fallback:
-                                            available_candidates = []
-
-                                routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-                                if routing_ip_type == "residential":
-                                    available_candidates = [n for n in available_candidates if n.get("ip_type") in ("residential", "mobile")]
-                                elif routing_ip_type == "hosting":
-                                    available_candidates = [n for n in available_candidates if n.get("ip_type") == "hosting"]
-
-                                if available_candidates:
-                                    auto_switch_node()
+                # 不在 state.lock 内连接，避免长时间持锁
+                if not active_openvpn_running():
+                    ensure_main_connection_from_available("测速后")
 
             valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
-            message = f"Fetched {len(candidates)} nodes. Tested {len(to_test_ids)} non-active nodes."
+            tested_n = len(locals().get("test_ids") or to_test_ids)
+            message = f"Fetched {len(candidates)} nodes. Tested {tested_n} nodes; available nodes used first for main proxy."
             state.set_state(
                 last_check_at=time.time(),
                 last_check_message=message,

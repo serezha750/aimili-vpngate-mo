@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import json
 import random
 import re
@@ -375,6 +374,68 @@ def clear_stale_active_flags(reason: str = "") -> None:
             state.set_state(active_openvpn_node_id="", active_node_latency="无活动连接")
 
 
+
+def filter_main_candidates(
+    nodes: list[dict[str, Any]],
+    ui_cfg: dict[str, Any],
+    *,
+    exclude_ids: set[str] | None = None,
+    bad_ids: set[str] | None = None,
+    require_available: bool = True,
+) -> list[dict[str, Any]]:
+    """按 UI 路由模式过滤主连接候选节点（国家/收藏/IP类型/ISP）。"""
+    exclude_ids = exclude_ids or set()
+    bad_ids = bad_ids or set()
+    routing_mode = ui_cfg.get("routing_mode", "auto")
+    target_country = ui_cfg.get("force_country", "")
+    candidates = []
+    for n in nodes:
+        nid = n.get("id")
+        if not nid or nid in exclude_ids or nid in bad_ids:
+            continue
+        if require_available and n.get("probe_status") != "available":
+            continue
+        candidates.append(n)
+
+    if routing_mode == "fixed_region" and target_country:
+        candidates = [
+            n for n in candidates
+            if n.get("country") == target_country
+            or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
+        ]
+    if routing_mode == "favorites":
+        fav_ids = set(ui_cfg.get("favorite_node_ids", []))
+        fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
+        if fav_candidates:
+            candidates = fav_candidates
+        else:
+            if not ui_cfg.get("fav_fail_fallback", True):
+                candidates = []
+
+    routing_ip_type = ui_cfg.get("routing_ip_type", "all")
+    if routing_ip_type == "residential":
+        candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
+    elif routing_ip_type == "hosting":
+        candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
+
+    routing_isp = str(ui_cfg.get("routing_isp", "") or "").strip()
+    if routing_isp:
+        kws = [k.strip().lower() for k in routing_isp.split(",") if k.strip()]
+        if kws:
+            candidates = [
+                n for n in candidates
+                if any(
+                    kw in (str(n.get("owner", "")) + " " + str(n.get("as_name", "")) + " " + str(n.get("asn", ""))).lower()
+                    for kw in kws
+                )
+            ]
+
+    candidates.sort(
+        key=lambda n: (utils.parse_int(n.get("latency_ms")) or 999999, -utils.parse_int(n.get("score")))
+    )
+    return candidates
+
+
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -397,47 +458,9 @@ def auto_switch_node(attempt: int = 0) -> None:
     with state.lock:
         nodes = state.read_nodes()
         bad = main_bad_node_ids()
-        # 仅排除「当前仍在跑」的节点，不因僵死 active 字段漏选
         live_id = state.active_openvpn_node_id if active_openvpn_running() else ""
-        candidates = [
-            n for n in nodes
-            if n.get("probe_status") == "available"
-            and n.get("id") not in bad
-            and n.get("id") != live_id
-        ]
-
-        if routing_mode == "fixed_region" and target_country:
-            candidates = [
-                n for n in candidates
-                if n.get("country") == target_country
-                or vpn_utils.COUNTRY_TRANSLATIONS.get(n.get("country", ""), n.get("country", "")) == target_country
-            ]
-        if routing_mode == "favorites":
-            fav_ids = set(ui_cfg.get("favorite_node_ids", []))
-            fav_candidates = [n for n in candidates if n.get("id") in fav_ids]
-            if fav_candidates:
-                candidates = fav_candidates
-            else:
-                fav_fail_fallback = ui_cfg.get("fav_fail_fallback", True)
-                if not fav_fail_fallback:
-                    candidates = []
-
-        routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-        if routing_ip_type == "residential":
-            candidates = [n for n in candidates if n.get("ip_type") in ("residential", "mobile")]
-        elif routing_ip_type == "hosting":
-            candidates = [n for n in candidates if n.get("ip_type") == "hosting"]
-
-        routing_isp = str(ui_cfg.get("routing_isp", "") or "").strip()
-        if routing_isp:
-            kws = [k.strip().lower() for k in routing_isp.split(",") if k.strip()]
-            if kws:
-                candidates = [
-                    n for n in candidates
-                    if any(kw in (str(n.get("owner", "")) + " " + str(n.get("as_name", "")) + " " + str(n.get("asn", ""))).lower() for kw in kws)
-                ]
-
-        candidates.sort(key=lambda n: (utils.parse_int(n.get("latency_ms")) or 999999, -utils.parse_int(n.get("score"))))
+        exclude = {live_id} if live_id else set()
+        candidates = filter_main_candidates(nodes, ui_cfg, exclude_ids=exclude, bad_ids=bad)
 
     if candidates:
         next_node = candidates[0]
@@ -767,45 +790,6 @@ def sync_publicvpnlist_import() -> int:
             print(f"[publicvpnlist] 导入 {len(new_ids)} 个新节点", flush=True)
         return len(new_ids)
 
-def run_publicvpnlist_import_and_test() -> None:
-    if not config.PUBLICVPNLIST_SCRIPT.exists():
-        return
-
-    with PUBLICVPNLIST_LOCK:
-        global PUBLICVPNLIST_LAST_RUN
-        now = time.time()
-        if now - PUBLICVPNLIST_LAST_RUN < config.PUBLICVPNLIST_INTERVAL:
-            return
-        PUBLICVPNLIST_LAST_RUN = now
-
-    def _task() -> None:
-        try:
-            print("[publicvpnlist] 开始后台下载与导入...", flush=True)
-            import subprocess
-            env = os.environ.copy()
-            env["OUT_DIR"] = str(config.ROOT_DIR / "publicvpnlist-ovpn")
-            proc = subprocess.Popen(
-                [sys.executable, str(config.PUBLICVPNLIST_SCRIPT), "--skip-import"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-            stdout, stderr = proc.communicate(timeout=600)
-            if proc.returncode != 0:
-                print(f"[publicvpnlist] 下载失败: {stderr}", flush=True)
-                return
-
-            new_ids = _import_publicvpnlist_nodes()
-            if new_ids:
-                print(f"[publicvpnlist] 发现 {len(new_ids)} 个新节点，开始独立并发检测 (并发数: {config.PUBLICVPNLIST_TEST_CONCURRENCY})...", flush=True)
-                test_multiple_nodes(new_ids, max_workers=config.PUBLICVPNLIST_TEST_CONCURRENCY)
-                print(f"[publicvpnlist] 新节点检测完成", flush=True)
-        except Exception as e:
-            print(f"[publicvpnlist] 后台任务异常: {e}", flush=True)
-
-    threading.Thread(target=_task, daemon=True).start()
-
 
 def ensure_main_connection_from_available(reason: str = "") -> bool:
     """若主连接未运行，且节点池中已有 probe_status=available 的节点，立即连接。
@@ -826,7 +810,6 @@ def ensure_main_connection_from_available(reason: str = "") -> bool:
         nodes = state.read_nodes()
         if not any(n.get("id") == target_id for n in nodes):
             return False
-        # 允许打断「仅测速」占用的 is_connecting
         state.is_connecting = False
         try:
             print(f"[快速连接] 固定 IP 模式立即拉起节点 {target_id} ({reason})", flush=True)
@@ -841,7 +824,6 @@ def ensure_main_connection_from_available(reason: str = "") -> bool:
     if available_count <= 0:
         return False
 
-    # 测速过程中 is_connecting 可能为 True，会挡住 connect_node；此处强制放开
     state.is_connecting = False
     try:
         print(
@@ -1046,16 +1028,6 @@ def check_proxy_health() -> dict[str, Any]:
             return [(socket.AF_INET6, host), (socket.AF_INET, "127.0.0.1")]
         return [(socket.AF_INET, host)]
 
-    def _proxy_url_hosts() -> list[str]:
-        host = config.LOCAL_PROXY_HOST
-        if host == "::":
-            return ["[::1]", "127.0.0.1"]
-        if host == "0.0.0.0":
-            return ["127.0.0.1"]
-        if ":" in host:
-            return [f"[{host}]", "127.0.0.1"]
-        return [host]
-
     def _tcp_probe(timeout: float = 1.5) -> bool:
         for af, connect_host in _local_proxy_connect_hosts():
             s = None
@@ -1086,95 +1058,35 @@ def check_proxy_health() -> dict[str, Any]:
             "error": "[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] VPN 虚拟网卡 (tun0) 未启用，请确保当前已成功连接 VPN 节点",
         }
 
-    # 多端点：任一成功即可；并行缩短最坏等待
-    health_endpoints = (
-        "http://api.ipify.org",
-        "http://ip.sb",
-        "http://ifconfig.me/ip",
-        "http://icanhazip.com",
-    )
-    curl_max_time = 3  # 秒
-    curl_proc_timeout = curl_max_time + 1
-
-    def _looks_like_ip(text: str) -> bool:
-        text = text.strip()
-        if not text or len(text) > 45:
-            return False
-        # 粗校验：IPv4 或 IPv6 字符集，避免把 HTML 错误页当 IP
-        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", text):
-            return True
-        if ":" in text and re.match(r"^[0-9a-fA-F:]+$", text):
-            return True
-        return False
-
-    def _curl_check_ip(url: str) -> dict[str, Any] | None:
-        proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
-        for p_host in _proxy_url_hosts():
-            proxy_url = f"socks5h://{p_host}:{config.LOCAL_PROXY_PORT}"
-            cmd = [
-                "curl", "-s", "-L",
-                "--max-redirs", "2",
-                "-w", "\n%{time_total} %{http_code}",
-                "-x", proxy_url,
-                url,
-                "--max-time", str(curl_max_time),
-            ]
-            if proxy_user is not None and proxy_pass is not None:
-                cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
-            try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=curl_proc_timeout)
-                if res.returncode != 0:
-                    continue
-                lines = res.stdout.strip().splitlines()
-                if len(lines) < 2:
-                    continue
-                ip = lines[0].strip()
-                time_info = lines[-1].strip().split()
-                if len(time_info) != 2:
-                    continue
-                total_time_str, http_code = time_info
-                if http_code != "200" or not _looks_like_ip(ip):
-                    continue
-                latency_ms = int(float(total_time_str) * 1000)
-                return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-            except Exception:
-                continue
-        return None
-
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(health_endpoints))
+    # 出口探测统一走 vpn_utils（与多出口同一套并行端点）
     try:
-        # 并行探测；拿到第一个成功结果即返回，并尽快结束线程池等待
-        futures = {pool.submit(_curl_check_ip, url): url for url in health_endpoints}
-        try:
-            for fut in concurrent.futures.as_completed(futures, timeout=curl_proc_timeout + 1):
-                try:
-                    result = fut.result()
-                except Exception:
-                    continue
-                if result and result.get("ok"):
-                    return result
-        except concurrent.futures.TimeoutError:
-            pass
+        proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
+        connect_host = "127.0.0.1"
+        for _af, h in _local_proxy_connect_hosts():
+            connect_host = h
+            break
+        ok, ip, latency_ms = vpn_utils.probe_public_ip_via_socks(
+            config.LOCAL_PROXY_PORT,
+            host=connect_host,
+            timeout=3.0,
+            proxy_user=proxy_user,
+            proxy_pass=proxy_pass,
+        )
+        if ok:
+            return {"ok": True, "ip": ip, "latency_ms": latency_ms}
 
-        # 全部失败：再确认代理端口是否仍在监听，区分“代理挂了”和“出口不通”
         if not _tcp_probe(1.0):
             diag = vpn_utils.diagnose_local_obstructions(config.LOCAL_PROXY_PORT, host=config.LOCAL_PROXY_HOST)
             if diag:
                 return {"ok": False, "error": f"出口连接测试失败 | 本机诊断结果: {diag[1]}"}
             return {"ok": False, "error": f"出口连接测试失败 | 代理端口 {config.LOCAL_PROXY_PORT} 已不可达"}
 
-        tried = ", ".join(health_endpoints)
         return {
             "ok": False,
-            "error": (
-                f"出口连接测试失败（已并行尝试: {tried}；"
-                "可能是节点已失效、隧道不转发，或 VPS 防火墙限制了相关出站）"
-            ),
+            "error": "出口连接测试失败（并行多端点均不可达；可能是节点已失效、隧道不转发，或出站受限）",
         }
     except Exception as e:
         return {"ok": False, "error": f"出口连接测试异常: {e}"}
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def background_proxy_checker() -> None:

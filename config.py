@@ -7,7 +7,6 @@ import json
 import re
 import random
 import string
-import hashlib
 import threading
 from pathlib import Path
 from typing import Any
@@ -186,10 +185,6 @@ def load_ui_config() -> dict[str, Any]:
     UI_PORT = bounded_int(config.get("port"), UI_PORT, 1, 65535)
     UI_HOST = config.get("host", UI_HOST)
     return config
-
-def get_session_token(password: str, username: str = "admin") -> str:
-    salt = "aimilivpn_secure_salt_2026"
-    return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
 
 def upstream_proxy_auth_file() -> str | None:
     import vpn_utils

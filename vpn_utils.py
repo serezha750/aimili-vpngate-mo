@@ -11,6 +11,8 @@ import urllib.request
 import threading
 from pathlib import Path
 from typing import Any
+import concurrent.futures
+import ipaddress
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
@@ -691,3 +693,88 @@ def diagnose_local_obstructions(proxy_port: int = 7928, host: str = "127.0.0.1")
                 pass
 
     return None
+
+
+_EGRESS_ENDPOINTS = (
+    "http://api.ipify.org",
+    "http://ip.sb",
+    "http://ifconfig.me/ip",
+    "http://icanhazip.com",
+)
+
+
+def parse_public_ip_text(body: str) -> str | None:
+    body = (body or "").strip()
+    if not body or len(body) > 64:
+        return None
+    body = body.splitlines()[0].strip()
+    try:
+        ip = ipaddress.ip_address(body)
+    except ValueError:
+        return None
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        return None
+    return str(ip)
+
+
+def probe_public_ip_via_socks(
+    port: int,
+    host: str = "127.0.0.1",
+    timeout: float = 3.0,
+    proxy_user: str | None = None,
+    proxy_pass: str | None = None,
+) -> tuple[bool, str, int]:
+    """经 SOCKS5 并行探测公网 IP。返回 (ok, ip, latency_ms)。"""
+    t = float(timeout)
+    proxy_host = host if host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    if ":" in proxy_host and not proxy_host.startswith("["):
+        # bare ipv6
+        proxy_url_base = f"socks5h://[{proxy_host}]:{port}"
+    else:
+        proxy_url_base = f"socks5h://{proxy_host}:{port}"
+
+    def _one(url: str) -> tuple[str, int] | None:
+        cmd = [
+            "curl", "-s", "-L", "--max-redirs", "2",
+            "-w", "\n%{time_total} %{http_code}",
+            "-x", proxy_url_base,
+            url,
+            "--max-time", str(int(max(1, t))),
+        ]
+        if proxy_user is not None and proxy_pass is not None:
+            cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=t + 1.5)
+            if res.returncode != 0:
+                return None
+            lines = res.stdout.strip().splitlines()
+            if len(lines) < 2:
+                return None
+            meta = lines[-1].strip().split()
+            if len(meta) != 2 or meta[1] != "200":
+                return None
+            ip = parse_public_ip_text("\n".join(lines[:-1]))
+            if not ip:
+                return None
+            latency_ms = int(float(meta[0]) * 1000)
+            return ip, latency_ms
+        except Exception:
+            return None
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(_EGRESS_ENDPOINTS))
+    try:
+        futs = {pool.submit(_one, url): url for url in _EGRESS_ENDPOINTS}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=t + 2):
+                try:
+                    got = fut.result()
+                except Exception:
+                    continue
+                if got:
+                    return True, got[0], got[1]
+        except concurrent.futures.TimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return False, "", 0
+

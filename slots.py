@@ -107,15 +107,6 @@ def _maybe_flush_history() -> None:
     flush_slot_history(force=True)
 
 
-def save_slot_history(history: dict[str, list[str]]) -> None:
-    """兼容旧接口：更新缓存并标记脏，再尝试按间隔刷盘。"""
-    global _slot_history_cache, _slot_history_dirty
-    with _slot_history_lock:
-        _slot_history_cache = {str(k): list(v) if isinstance(v, list) else [str(v)] for k, v in history.items()}
-        _slot_history_dirty = True
-    _maybe_flush_history()
-
-
 def get_used_nodes(history: dict[str, list[str]]) -> set[str]:
     used: set[str] = set()
     for ids in history.values():
@@ -600,75 +591,11 @@ def release_tun_device(dev: str) -> None:
         pass
 
 # ---------- 启动时出口验证（带重试，类似 manager.py 的 check_proxy_health） ----------
-_EGRESS_ENDPOINTS = (
-    "http://api.ipify.org",
-    "http://ip.sb",
-    "http://ifconfig.me/ip",
-    "http://icanhazip.com",
-)
-
-
-def _parse_public_ip(body: str) -> str | None:
-    body = (body or "").strip()
-    if not body or len(body) > 64:
-        return None
-    # 取第一行，避免部分站点尾部带多余文本
-    body = body.splitlines()[0].strip()
-    try:
-        ip = ipaddress.ip_address(body)
-    except ValueError:
-        return None
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified:
-        return None
-    return str(ip)
-
-
-def _curl_one_egress(port: int, url: str, timeout: float) -> str | None:
-    try:
-        res = subprocess.run(
-            [
-                "curl", "-s", "-L", "--max-redirs", "2",
-                "-x", f"socks5h://127.0.0.1:{port}",
-                url,
-                "--max-time", str(timeout),
-                "-w", "\n%{http_code}",
-            ],
-            capture_output=True, text=True, timeout=timeout + 1.5,
-        )
-        if res.returncode != 0:
-            return None
-        lines = res.stdout.strip().splitlines()
-        if len(lines) < 2:
-            return None
-        http_code = lines[-1].strip()
-        body = "\n".join(lines[:-1]).strip()
-        if http_code != "200":
-            return None
-        return _parse_public_ip(body)
-    except Exception:
-        return None
-
-
 def probe_slot_egress(port: int, timeout: float | None = None) -> tuple[bool, str]:
-    """经槽位 SOCKS5 并行探测公网出口 IP；任一端点成功即返回。"""
+    """经槽位 SOCKS5 并行探测公网出口 IP（统一走 vpn_utils）。"""
     t = float(timeout if timeout is not None else config.SLOT_EGRESS_CURL_TIMEOUT)
-    endpoints = _EGRESS_ENDPOINTS
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints))
-    try:
-        futs = {pool.submit(_curl_one_egress, port, url, t): url for url in endpoints}
-        try:
-            for fut in concurrent.futures.as_completed(futs, timeout=t + 2):
-                try:
-                    ip = fut.result()
-                except Exception:
-                    continue
-                if ip:
-                    return True, ip
-        except concurrent.futures.TimeoutError:
-            pass
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
-    return False, ""
+    ok, ip, _lat = vpn_utils.probe_public_ip_via_socks(port, host="127.0.0.1", timeout=t)
+    return ok, ip
 
 
 def wait_for_proxy_ready(port: int, max_attempts: int = 2, timeout_per_attempt: float | None = None) -> tuple[bool, str]:

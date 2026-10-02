@@ -10,6 +10,7 @@ import threading
 import urllib.parse
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 def parse_positive_int(value: str | None, default: int) -> int:
@@ -123,6 +124,24 @@ def check_credentials(username: str | None, password: str | None) -> bool:
         return True
     return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
 
+
+_last_tun_missing_log: dict[str, float] = {}
+_TUN_MISSING_LOG_INTERVAL = 60.0
+
+def _device_exists(device: str) -> bool:
+    try:
+        return Path(f"/sys/class/net/{device}").exists()
+    except Exception:
+        return False
+
+def _log_tun_missing_once(device: str, detail: str) -> None:
+    now = time.time()
+    last = _last_tun_missing_log.get(device, 0.0)
+    if now - last < _TUN_MISSING_LOG_INTERVAL:
+        return
+    _last_tun_missing_log[device] = now
+    print(f"[代理失败] {device} 不可用（限流 {int(_TUN_MISSING_LOG_INTERVAL)}s）: {detail}", flush=True)
+
 def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float, device: str = "tun0") -> str | None:
     import random
     sock = None
@@ -145,15 +164,19 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float, 
         qtype_qclass = qtype.to_bytes(2, "big") + b"\x00\x01"
         packet = tx_id + flags + questions + rrs + qname + qtype_qclass
 
+        # 无隧道设备时直接失败，避免每次请求都刷 3004
+        if not _device_exists(device):
+            _log_tun_missing_once(device, "DNS 绑定失败：网卡不存在，主连接 OpenVPN 未建立或已断开")
+            return None
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, device.encode("utf-8"))
         except OSError as e:
             if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print(f"[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 {device} 权限不足，请确保程序以 root 权限运行！", flush=True)
+                _log_tun_missing_once(device, "DNS 绑定失败：权限不足（需 root）")
             elif "no such device" in str(e).lower() or e.errno == 19:
-                print(f"[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 {device} 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+                _log_tun_missing_once(device, "DNS 绑定失败：网卡不存在")
             return None
         sock.sendto(packet, (dns_server, 53))
         resp, _ = sock.recvfrom(4096)
@@ -282,20 +305,14 @@ def purge_dns_cache(device: str | None = None) -> int:
             _dns_cache.pop(k, None)
         return len(keys)
 
-
-_last_tun_missing_log: dict[str, float] = {}
-_TUN_MISSING_LOG_INTERVAL = 30.0  # 同一设备缺少时最多每 30s 打一次完整错误日志
-
-def _log_tun_missing_once(device: str, detail: str) -> None:
-    now = time.time()
-    last = _last_tun_missing_log.get(device, 0.0)
-    if now - last < _TUN_MISSING_LOG_INTERVAL:
-        return
-    _last_tun_missing_log[device] = now
-    print(f"[代理失败] {device} 暂不可用（限流日志）: {detail}", flush=True)
-
 def create_connection(address: tuple[str, int], timeout: float = 20, device: str = "tun0") -> socket.socket:
     host, port = address
+    if not _device_exists(device):
+        _log_tun_missing_once(device, "出站连接失败：VPN 网卡不存在（OpenVPN 未连接）")
+        raise OSError(
+            f"[错误代码 3004] [ERR_ROUTE_DEV_NOT_FOUND] 绑定虚拟网卡 {device} 失败，找不到设备！"
+            "这通常是因为 OpenVPN 核心未能成功连接或已被异常终止。"
+        )
     resolved_ip = resolve_dns_over_tun0(host, device=device)
     if resolved_ip:
         host = resolved_ip

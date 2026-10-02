@@ -1101,6 +1101,12 @@ def background_proxy_checker() -> None:
                 time.sleep(5)
                 continue
 
+            # 无 tun0 / OpenVPN 未跑时优先尝试快速拉起，避免业务侧无限刷 3004
+            if not active_openvpn_running() or not Path("/sys/class/net/tun0").exists():
+                ensure_main_connection_from_available("守护检测-主连接缺失")
+                time.sleep(8)
+                continue
+
             res = check_proxy_health()
             if res["ok"]:
                 state.set_state(

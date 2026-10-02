@@ -352,6 +352,29 @@ def clear_active_connection_state(message: str) -> None:
         last_check_message=message,
     )
 
+
+def clear_stale_active_flags(reason: str = "") -> None:
+    """进程未运行时清除 nodes.json 中残留的 active，避免候选被误排除。"""
+    if active_openvpn_running():
+        return
+    with state.lock:
+        nodes = state.read_nodes()
+        changed = False
+        for item in nodes:
+            if item.get("active"):
+                item["active"] = False
+                changed = True
+        if changed:
+            state.write_json(config.NODES_FILE, nodes)
+            msg = f"已清理僵死 active 标记 ({reason})" if reason else "已清理僵死 active 标记"
+            print(f"[状态修复] {msg}", flush=True)
+            utils.log_to_json("INFO", "VPN", msg)
+        if state.active_openvpn_node_id:
+            state.active_openvpn_node_id = ""
+            state.active_openvpn_process = None
+            state.set_state(active_openvpn_node_id="", active_node_latency="无活动连接")
+
+
 def auto_switch_node(attempt: int = 0) -> None:
     if attempt >= 3:
         print("[自动切换] 连续切换失败已达 3 次，停止切换以防止主线程死锁，将在后台重新加载节点...", flush=True)
@@ -370,14 +393,17 @@ def auto_switch_node(attempt: int = 0) -> None:
         print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
         return
 
+    clear_stale_active_flags("auto_switch前")
     with state.lock:
         nodes = state.read_nodes()
         bad = main_bad_node_ids()
+        # 仅排除「当前仍在跑」的节点，不因僵死 active 字段漏选
+        live_id = state.active_openvpn_node_id if active_openvpn_running() else ""
         candidates = [
             n for n in nodes
             if n.get("probe_status") == "available"
-            and not n.get("active")
             and n.get("id") not in bad
+            and n.get("id") != live_id
         ]
 
         if routing_mode == "fixed_region" and target_country:
@@ -541,25 +567,47 @@ def connect_node(node_id: str) -> str:
 
         state.set_state(last_check_message="正在测试本地代理出站联通性与出口 IP...")
         res = check_proxy_health()
-        if res["ok"]:
+        if not res.get("ok"):
+            # 握手成功但出口不通 = 假活：拆掉隧道、拉黑并失败，交给上层 auto_switch
+            err = res.get("error") or "出口探测失败"
+            print(f"[连接核心] 节点 {node_id} 隧道已建立但出口不可用: {err}，将标记不可用并切换", flush=True)
+            utils.log_to_json("WARNING", "VPN", f"节点 {node_id} 假活（出口失败）: {err}")
+            mark_main_bad_node(node_id)
+            try:
+                for item in nodes:
+                    if item.get("id") == node_id:
+                        item["probe_status"] = "unavailable"
+                        item["probe_message"] = f"egress_failed: {err}"
+                        item["active"] = False
+                    else:
+                        item["active"] = False
+                state.write_json(config.NODES_FILE, nodes)
+            except Exception:
+                pass
+            stop_active_openvpn()
             state.set_state(
-                proxy_ok=True,
-                proxy_ip=res["ip"],
-                proxy_latency_ms=res["latency_ms"],
-                proxy_error=""
-            )
-            reset_main_proxy_connections()
-        else:
-            state.set_state(
+                active_openvpn_node_id="",
+                is_connecting=False,
                 proxy_ok=False,
                 proxy_ip="-",
                 proxy_latency_ms=0,
-                proxy_error=res.get("error", "未知错误")
+                proxy_error=err,
+                active_node_latency="无活动连接",
+                last_check_message=f"出口失败，已断开假活节点: {err}",
             )
+            raise RuntimeError(f"egress_failed: {err}")
+
+        state.set_state(
+            proxy_ok=True,
+            proxy_ip=res["ip"],
+            proxy_latency_ms=res["latency_ms"],
+            proxy_error=""
+        )
+        reset_main_proxy_connections()
 
         latency_str = f"{state.last_active_latency} ms" if state.last_active_latency > 0 else "检测超时"
         state.set_state(active_openvpn_node_id=node_id, is_connecting=False, last_check_message=f"Connected {node_id}", active_node_latency=latency_str)
-        utils.log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用")
+        utils.log_to_json("INFO", "VPN", f"节点 {node_id} 连接成功，出口网卡 tun0 已启用，出口IP {res.get('ip')}")
         return f"Connected {node_id}"
     except Exception as exc:
         if stopped_existing or (state.active_openvpn_node_id == node_id and not active_openvpn_running()):
@@ -817,6 +865,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
         return msg
     # 注意：全量测速不再占用 is_connecting，避免挡住 7928 使用「已可用」节点
     try:
+        clear_stale_active_flags("维护开始")
         if force:
             with state.lock:
                 stop_active_openvpn()
@@ -908,9 +957,12 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 n["id"] for n in current_nodes
                 if not n.get("active") and n.get("probe_status") == "available"
             ]
-            # 已可用节点每轮最多抽检一部分，避免长期占用且拖慢主连接
+            # 已可用节点每轮随机抽检一部分，避免总是复测同一批
             recheck_cap = max(10, min(30, len(already_ok) // 5 or 10))
-            recheck_ids = already_ok[:recheck_cap]
+            if len(already_ok) <= recheck_cap:
+                recheck_ids = list(already_ok)
+            else:
+                recheck_ids = random.sample(already_ok, recheck_cap)
             test_ids = priority_ids + recheck_ids
 
             # 测速前再尝试一次快速连接（合并后可能已有历史 available）
@@ -1217,8 +1269,11 @@ def active_node_pinger() -> None:
                 else:
                     state.set_state(active_node_latency="检测超时")
             elif state.is_connecting:
-                state.set_state(active_node_latency="测试中...")
+                state.set_state(active_node_latency="连接中...")
             else:
+                # 进程已死但状态未清时修正文案
+                if state.active_openvpn_node_id and not active_openvpn_running():
+                    clear_stale_active_flags("pinger")
                 state.set_state(active_node_latency="无活动连接")
         except Exception as e:
             print(f"[ERROR] active_node_pinger error: {e}", flush=True)

@@ -282,6 +282,18 @@ def purge_dns_cache(device: str | None = None) -> int:
             _dns_cache.pop(k, None)
         return len(keys)
 
+
+_last_tun_missing_log: dict[str, float] = {}
+_TUN_MISSING_LOG_INTERVAL = 30.0  # 同一设备缺少时最多每 30s 打一次完整错误日志
+
+def _log_tun_missing_once(device: str, detail: str) -> None:
+    now = time.time()
+    last = _last_tun_missing_log.get(device, 0.0)
+    if now - last < _TUN_MISSING_LOG_INTERVAL:
+        return
+    _last_tun_missing_log[device] = now
+    print(f"[代理失败] {device} 暂不可用（限流日志）: {detail}", flush=True)
+
 def create_connection(address: tuple[str, int], timeout: float = 20, device: str = "tun0") -> socket.socket:
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host, device=device)
@@ -413,7 +425,7 @@ def socks5_client(client: socket.socket, first_byte: bytes, device: str = "tun0"
         try:
             upstream = create_connection((host, port), timeout=20, device=device)
         except Exception as e:
-            print(f"[SOCKS5 代理失败] 目标 {host}:{port} 连接失败: {e}", flush=True)
+            _log_tun_missing_once(device, f"[SOCKS5] {host}:{port} -> {e}")
             try:
                 client.sendall(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")
             except OSError:
@@ -506,7 +518,7 @@ def http_client(client: socket.socket, first_byte: bytes, device: str = "tun0") 
         upstream.sendall(request.encode("iso-8859-1") + rest)
         relay(client, upstream)
     except Exception as e:
-        print(f"[HTTP 代理失败] 代理请求目标连接失败: {e}", flush=True)
+        _log_tun_missing_once(device, str(e))
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
@@ -527,7 +539,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int], device: str = 
     except Exception as e:
         err_msg = str(e)
         if "[错误代码" in err_msg:
-            print(f"[代理客户端连接失败] 客户端 {address} 遭遇系统性阻碍: {err_msg}", flush=True)
+            _log_tun_missing_once(device, f"client {address}: {err_msg}")
         try:
             client.close()
         except OSError:
